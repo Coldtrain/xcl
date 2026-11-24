@@ -673,11 +673,18 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 116 | 117) {
         d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
     }
-    // B5G5R5A1 / B4G4R4A4 targets: not ones a PC driver takes for rendering together with
-    // unordered access (a retail game's 2560x1440 one, flags 0x5: E_INVALIDARG) – R8G8B8A8, the
-    // same values with more bits; the GPU's own (nothing of the CPU's is laid out for them)
-    if matches!(format, 86 | 115) && flags & 5 != 0 {
-        d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+    // Formats with no PC render-target / UAV equivalent: use a wider color format for the
+    // console's B5G5R5A1 / B4G4R4A4 targets and R9G9B9E5 shared-exponent targets.
+    // The title's GPU memory is not laid out for these resources, so the host copy may differ.
+    if flags & 5 != 0 {
+        let host_format = match format {
+            67 => Some(10),       // R16G16B16A16_FLOAT
+            86 | 115 => Some(28), // R8G8B8A8_UNORM
+            _ => None,
+        };
+        if let Some(host_format) = host_format {
+            d[0x20..0x24].copy_from_slice(&host_format.to_le_bytes());
+        }
     }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
@@ -715,11 +722,12 @@ fn depth_typeless(f: u32) -> Option<u32> {
     }
 }
 
-/// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, and a
-/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 (`pc_resource_desc`).
+/// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, with
+/// console formats unsupported for render-target / UAV use mapped to host equivalents.
 pub fn pc_target_format(f: u32) -> u32 {
     match f {
-        86 | 115 => 28,
+        67 => 10,       // R9G9B9E5_SHAREDEXP → R16G16B16A16_FLOAT
+        86 | 115 => 28, // B5G5R5A1 / B4G4R4A4 → R8G8B8A8_UNORM
         f => pc_view_format(f),
     }
 }
@@ -1068,6 +1076,8 @@ mod tests {
         x[0x20] = 86; // B5G5R5A1 target that is also a UAV
         x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
         assert_eq!(desc(&x), (28, 0x5));
+        x[0x20] = 67; // R9G9B9E5 render target / UAV
+        assert_eq!(desc(&x), (10, 0x5));
         // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
         assert_eq!(pc_shader_view_format(44, 45), 46);
         assert_eq!(pc_shader_view_format(44, 56), 46);
@@ -1078,7 +1088,7 @@ mod tests {
         assert_eq!(pc_shader_view_format(19, 62), 22);
         assert_eq!(pc_shader_view_format(28, 86), 28);
         assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
-        assert_eq!((pc_target_format(86), pc_target_format(118), pc_view_format(117)), (28, 45, 10));
+        assert_eq!((pc_target_format(67), pc_target_format(86), pc_target_format(118), pc_view_format(117)), (10, 28, 45, 10));
     }
 
     #[test]
