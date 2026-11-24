@@ -4231,13 +4231,29 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return None;
     }
     if let Some(a) = as_slot {
-        let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
-        note_translation_error(format!(
-            "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
-            crate::gpu::shader::fnv64(a),
-            crate::gpu::shader::fnv64(ms)
-        ));
-        return Some(E_INVALIDARG);
+        // Experimental bring-up path: allow the mesh stage to run without the console
+        // amplification stage. This is not semantically equivalent to AS execution (it
+        // omits amplification/culling and may under-dispatch); it is useful to establish
+        // whether the title's gameplay path can render with the translated MS alone.
+        // Keep it opt-in until native AS translation/dispatch is implemented.
+        if std::env::var("XCL_MESH_IGNORE_AS").is_ok_and(|v| v != "0") {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 32 {
+                crate::xlog_warn!(
+                    "D3D12.X: EXPERIMENTAL: ignoring console AS {:016x} for MS {:016x}; mesh dispatch may be incomplete",
+                    crate::gpu::shader::fnv64(a),
+                    crate::gpu::shader::fnv64(ms)
+                );
+            }
+        } else {
+            let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
+            note_translation_error(format!(
+                "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; set XCL_MESH_IGNORE_AS=1 to test MS-only execution; subobjects {types:?}",
+                crate::gpu::shader::fnv64(a),
+                crate::gpu::shader::fnv64(ms)
+            ));
+            return Some(E_INVALIDARG);
+        }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
