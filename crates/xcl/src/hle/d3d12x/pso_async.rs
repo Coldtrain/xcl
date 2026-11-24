@@ -349,7 +349,7 @@ fn preload() -> Option<&'static Preload> {
         .as_ref()?;
     STARTED.call_once(|| {
         let n = (worker_threads() / 4).clamp(2, 4);
-        crate::xlog_info!("D3D12.X: PSO preload enabled (max {} speculative PSOs, {} GiB commit reserve, {} workers)", preload_max(), std::env::var("XCL_PSO_PRELOAD_RESERVE_GB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(8), n);
+        crate::xlog_info!("D3D12.X: PSO preload enabled (max {} speculative PSOs, {} GiB commit reserve, {} workers)", preload_max(), std::env::var("XCL_PSO_PRELOAD_RESERVE_GB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(12), n);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 unsafe {
