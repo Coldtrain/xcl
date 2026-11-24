@@ -25,6 +25,7 @@
 //! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
 //! UAV at 2k + 1.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -279,6 +280,10 @@ pub fn unregister(obj: usize) {
         heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
     };
     if let Some(h) = gone {
+        let end = h.shadow.saturating_add(h.n as usize * h.slot_bytes() as usize);
+        if let Some(kept) = KEPT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            kept.retain(|&at, _| at < h.shadow || at >= end);
+        }
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             release_global(f, page_descriptors(h.n, p as u32));
         }
@@ -368,7 +373,28 @@ pub unsafe fn publish_range(first: &Slot, n: u32) {
 }
 
 /// view slot address → the resource its view names (`XCL_TRACE_FRAME` diagnostics)
-static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
+static RES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+/// Resources referenced by live console view descriptors. D3D12 descriptor heaps do not
+/// retain the resources named by their descriptors; a title can release a resource while a
+/// recorded list or a stale bindless descriptor can still read it. Keep one COM reference per
+/// occupied slot until that slot is rewritten or its heap is released.
+static KEPT: Mutex<Option<HashMap<usize, ID3D12Resource>>> = Mutex::new(None);
+
+/// Retain the resource named by view slot `s`, or release the previous resource when the slot
+/// becomes a null / buffer-only ABI descriptor.
+pub fn keep_resource(s: &Slot, resource: Option<ID3D12Resource>) {
+    if s.sampler {
+        return;
+    }
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = kept.get_or_insert_with(HashMap::new);
+    if let Some(resource) = resource {
+        map.insert(s.at, resource);
+    } else {
+        map.remove(&s.at);
+    }
+}
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
@@ -409,6 +435,8 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     write(dst, &w[..n]);
     if !src.sampler {
         note_resource(dst, resource_at(src.at).unwrap_or(0));
+        let resource = KEPT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&src.at).cloned());
+        keep_resource(dst, resource);
     }
 }
 
