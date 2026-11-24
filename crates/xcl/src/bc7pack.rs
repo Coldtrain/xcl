@@ -1,7 +1,7 @@
 //! BCPack BC7 (codec 0x1C) chunks -> plain BC7 blocks.
 //!
 //! Ported from holdmysocks/SixNG `crates/sixng-core/src/bc7pack.rs`
-//! (GPL-3.0-only, upstream commit 9b38e3c0245a7cacd4d04d7f6671521c14111b5e).
+//! (GPL-3.0-only, upstream commit b57cdb036839c559d60da648925239d25dbb3ee9).
 //! Adapted to XCL's in-tree MDU rANS API; changed for this repository.
 //!
 //! The entropy layer is the one from `bcpack-rs` (16 lanes, two symbols per

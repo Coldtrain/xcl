@@ -110,6 +110,141 @@ pub fn subresources(t: &Image, mem: &[u8], cfg: PipeConfig) -> Result<Vec<Subres
     Ok(out)
 }
 
+
+/// Summary of a BC7 BCPack texture conversion.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bc7PackStats {
+    pub blocks: usize,
+    pub unfitted_blocks: usize,
+    pub invalid_blocks: usize,
+    pub normalized_blocks: usize,
+}
+
+/// Convert BC7 blocks emitted in physical GFX10 tile order into the row-major
+/// element order expected by a D3D12 subresource. The sort includes mip-tail
+/// origins, array-slice XORs and the base-address swizzle.
+fn bc7_stream_to_linear(
+    chain: &Chain,
+    level: usize,
+    slice: usize,
+    blocks: &[u8],
+) -> Result<Vec<u8>, String> {
+    let l = chain.levels.get(level).ok_or("BC7 mip level is out of range")?;
+    let count = l.width.checked_mul(l.height).ok_or("BC7 block count overflow")?;
+    let bytes = count.checked_mul(16).ok_or("BC7 subresource size overflow")?;
+    if blocks.len() != bytes {
+        return Err(format!("BC7 decoder returned {} bytes for {count} blocks (expected {bytes})", blocks.len()));
+    }
+    if slice >= chain.layers().max(1) && chain.layout.block_d > 1 {
+        return Err(format!("BC7 slice {slice} is outside the tiled depth layers"));
+    }
+
+    let mut order = Vec::with_capacity(count);
+    for y in 0..l.height {
+        for x in 0..l.width {
+            let offset = l.offset.checked_add(chain.layout.offset_z(
+                x + l.origin.0,
+                y + l.origin.1,
+                slice,
+                l.pitch,
+            )).ok_or("BC7 tiled element offset overflow")?;
+            if offset.checked_add(16).is_none_or(|end| end > chain.slice_bytes) {
+                return Err(format!("BC7 tiled element at {offset:#x} exceeds slice size {:#x}", chain.slice_bytes));
+            }
+            order.push((offset, y * l.width + x));
+        }
+    }
+    order.sort_unstable_by_key(|&(offset, _)| offset);
+    if order.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err("BC7 tile layout maps multiple blocks to the same address".into());
+    }
+
+    let mut linear = vec![0u8; bytes];
+    for (stream_index, &(_, linear_index)) in order.iter().enumerate() {
+        let src = stream_index * 16;
+        let dst = linear_index * 16;
+        linear[dst..dst + 16].copy_from_slice(&blocks[src..src + 16]);
+    }
+    Ok(linear)
+}
+
+/// Decode one BCPack BC7 chunk per array-slice/mip pair into D3D12 subresources.
+///
+/// The chunk order is array slice major, then mip level (D3D12 subresource order).
+/// The GFX10 image format alone cannot distinguish ordinary BC7 blocks from BCPack:
+/// callers must use this explicit entry point only when the source identifies BCPack
+/// codec 0x1C. Ordinary BC7 resources continue through subresources unchanged.
+pub fn bc7pack_subresources(
+    t: &Image,
+    chunks: &[&[u8]],
+    cfg: PipeConfig,
+) -> Result<(Vec<Subresource>, Bc7PackStats), String> {
+    if !matches!(t.format, 181 | 182) {
+        return Err(format!("GFX10 format {} is not BC7", t.format));
+    }
+    if !matches!(t.ty, ImageType::D2 | ImageType::D2Array | ImageType::Cube) {
+        return Err(format!("BC7 BCPack does not support image type {:?}", t.ty));
+    }
+    let p = placement(t, cfg)?;
+    if p.chain.layout.elem_log2 != 4 {
+        return Err("BC7 layout is not 16 bytes per compressed block".into());
+    }
+    let expected = p.slices.checked_mul(p.chain.levels.len()).ok_or("BC7 subresource count overflow")?;
+    if chunks.len() != expected {
+        return Err(format!("BC7 BCPack has {} chunks; texture requires {expected} (one per slice/mip)", chunks.len()));
+    }
+
+    let mut out = Vec::with_capacity(expected);
+    let mut stats = Bc7PackStats::default();
+    for slice in 0..p.slices {
+        for level in 0..p.chain.levels.len() {
+            let mip = p.chain.levels[level];
+            let blocks = mip.width.checked_mul(mip.height).ok_or("BC7 block count overflow")?;
+            let chunk_index = slice * p.chain.levels.len() + level;
+            let decoded = crate::bc7pack::decode(chunks[chunk_index], blocks)
+                .ok_or_else(|| format!("BC7 BCPack decode failed for slice {slice}, mip {level}"))?;
+            let data = bc7_stream_to_linear(&p.chain, level, slice, &decoded.blocks)
+                .map_err(|e| format!("BC7 BCPack slice {slice}, mip {level}: {e}"))?;
+            stats.blocks += blocks;
+            stats.unfitted_blocks += decoded.unfitted_blocks;
+            stats.invalid_blocks += decoded.invalid_blocks;
+            stats.normalized_blocks += decoded.normalized_blocks;
+            out.push(Subresource {
+                rows: mip.height,
+                row_bytes: mip.width.checked_mul(16).ok_or("BC7 row size overflow")?,
+                depth: 1,
+                data,
+            });
+        }
+    }
+    Ok((out, stats))
+}
+
+/// Create a D3D12 BC7 resource from explicit BCPack chunks. Chunks must be
+/// ordered array-slice major, then mip level. Use create for ordinary BC7.
+pub unsafe fn create_bc7pack(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    t: &Image,
+    chunks: &[&[u8]],
+    cfg: PipeConfig,
+) -> Result<(ID3D12Resource, Bc7PackStats), String> {
+    let (subs, stats) = bc7pack_subresources(t, chunks, cfg)?;
+    let (rd, _) = desc::image_d3d12(t).ok_or_else(|| format!("format {} without a DXGI equivalent", t.format))?;
+    let mut r: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &rd,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        None,
+        &mut r,
+    ).map_err(|x| format!("CreateCommittedResource: {x}"))?;
+    let r = r.ok_or("CreateCommittedResource without a resource")?;
+    upload(dev, queue, &r, &subs, D3D12_RESOURCE_STATE_COPY_DEST, SHADER_READ)?;
+    Ok((r, stats))
+}
+
 /// The console memory a T#'s texture occupies, when it lies in the unified memory (UMA).
 fn checked_span(start: u64, bytes: usize) -> Result<(usize, usize), String> {
     if bytes == 0 {
@@ -1057,4 +1192,35 @@ mod tests {
                 .clone()
         }
     }
+    #[test]
+    fn bc7_stream_order_is_reordered_to_row_major_for_tiled_mips() {
+        let layout = super::super::tiling::Layout::new(5, 4, CONSOLE_PIPES).unwrap();
+        let chain = Chain::new(layout, 256, 128, 4, 5);
+        let level = 0;
+        let l = chain.levels[level];
+        let count = l.width * l.height;
+        let mut blocks = vec![0u8; count * 16];
+        for i in 0..count {
+            blocks[i * 16..(i + 1) * 16].fill((i & 0xff) as u8);
+        }
+        let linear = bc7_stream_to_linear(&chain, level, 0, &blocks).unwrap();
+        let mut expected_order: Vec<(usize, usize)> = (0..l.height)
+            .flat_map(|y| (0..l.width).map(move |x| {
+                (l.offset + chain.layout.offset_z(x + l.origin.0, y + l.origin.1, 0, l.pitch), y * l.width + x)
+            }))
+            .collect();
+        expected_order.sort_unstable_by_key(|x| x.0);
+        for (stream, &(_, raster)) in expected_order.iter().enumerate() {
+            assert_eq!(linear[raster * 16], (stream & 0xff) as u8);
+        }
+    }
+
+    #[test]
+    fn bc7pack_subresources_require_explicit_bc7_format_and_one_chunk_per_mip() {
+        let mut t = image(181, ImageType::D2, 64, 64, 1, 2, 5, 0x40_0000);
+        assert!(bc7pack_subresources(&t, &[], CONSOLE_PIPES).unwrap_err().contains("requires 2"));
+        t.format = 177;
+        assert!(bc7pack_subresources(&t, &[], CONSOLE_PIPES).unwrap_err().contains("not BC7"));
+    }
+
 }
