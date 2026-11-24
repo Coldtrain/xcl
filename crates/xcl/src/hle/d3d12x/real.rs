@@ -2285,7 +2285,7 @@ unsafe extern "system" fn dev_create_committed_resource_layout_x(
 unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = super::device_x::pc_resource_desc(&x);
-    let hr = dev_create_committed_resource(this, props, 0, d.as_ptr() as usize, state, clear, riid, ppv);
+    let hr = create_committed_with_flag_fallback(this, props, 0, d.as_ptr() as usize, state, clear, riid, ppv);
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         crate::xlog_warn!("D3D12.X: display target: {hr:#x}; desc {x:02x?}");
         return hr;
