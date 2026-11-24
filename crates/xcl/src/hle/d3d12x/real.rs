@@ -5011,8 +5011,8 @@ unsafe fn copy_page_mappings_batch_x(count: usize, batches: usize, pool: usize, 
         return E_INVALIDARG;
     }
     if !super::device_x::is_registered_page_pool(pool as u64, pool_pages as u32) {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| crate::xlog_warn!("D3D12.X: CopyPageMappingsBatchX used an unregistered page pool; attempting validated mappings"));
+        crate::xlog_warn!("D3D12.X: CopyPageMappingsBatchX rejected unregistered page pool {pool:#x} ({pool_pages} pages)");
+        return E_INVALIDARG;
     }
     let batches = std::slice::from_raw_parts(batches as *const PageBatchX, count);
     let mut mapped = 0usize;
