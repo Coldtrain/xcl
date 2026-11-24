@@ -2205,7 +2205,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     pc_uav(slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
-    super::console_heap::keep_resource(&slot, ID3D12Resource::from_raw_borrowed(&res).map(|r| r.clone()));
+    super::console_heap::keep_resource(&slot, if no_uav { None } else { ID3D12Resource::from_raw_borrowed(&res).map(|r| r.clone()) });
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
     };
