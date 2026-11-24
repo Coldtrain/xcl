@@ -20,3 +20,14 @@ The returned `Bc7PackStats` reports total blocks, blocks that depended on unknow
 ## Scope
 
 This API completes the decoder-to-D3D12 upload path when the asset/streaming layer has identified the BCPack chunk boundaries. The current title-texture registration callback receives a live resource descriptor and a pointer to its console memory, but no BCPack codec tag or per-mip compressed-chunk boundaries. It must not auto-run the BCPack decoder against that memory: doing so would risk treating valid ordinary BC7 data as a compressed stream. Connect the explicit API at the layer that owns the BCPack metadata.
+
+
+## Runtime RDS5 / ETPF discovery
+
+XCL now indexes RDS5/ETPF metadata when DirectStorage opens a .ttpf file. It reads only the RDS5 header, chunk table, ETPF descriptors and texture hashes; pixel payloads are still read by the normal DirectStorage request path.
+
+Each DirectStorage request already carries the codec mode, source file offset/length, destination address and decoded length. XCL matches those values against an RDS5 chunk. Only an exact match establishes a runtime store base, calculated as destination minus the chunk virtual offset. This avoids identifying BCPack from a DXGI format value.
+
+The RDS5 registry can then match an ETPF texture descriptor to the title-memory address passed to CreatePlacedResourceX. Matched texture hashes and descriptors are logged for runtime validation. Physical-page destinations and partial/nonmatching requests do not establish a base; they continue through the existing DirectStorage handling without guessed metadata.
+
+DirectStorage BC7 mode 7 is now decoded by the SixNG-derived BC7 decoder, optionally after zlib, into ordinary 16-byte BC7 blocks. The title's existing texture upload path subsequently handles the GFX10 tiled layout.

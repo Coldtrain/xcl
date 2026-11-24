@@ -36,8 +36,7 @@ pub struct Store {
 }
 
 impl Store {
-    fn parse(file: &mut File, path: String) -> io::Result<Self> {
-        let file_len = file.metadata()?.len();
+    fn parse<R: Read + Seek>(file: &mut R, path: String, file_len: u64) -> io::Result<Self> {
         let mut header = [0u8; 24];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut header)?;
@@ -161,7 +160,8 @@ static STORES: OnceLock<Mutex<Vec<Weak<RuntimeStore>>>> = OnceLock::new();
 pub fn open(path: &str) -> Option<Arc<RuntimeStore>> {
     if !path.to_ascii_lowercase().ends_with(".ttpf") { return None; }
     let mut file = File::open(path).ok()?;
-    let store = Store::parse(&mut file, path.to_string()).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let store = Store::parse(&mut file, path.to_string(), file_len).ok()?;
     let runtime = Arc::new(RuntimeStore { store, bases: Mutex::new(Vec::new()) });
     let mut stores = STORES.get_or_init(|| Mutex::new(Vec::new())).lock().ok()?;
     stores.retain(|w| w.strong_count() > 0);
@@ -181,6 +181,7 @@ fn u64le(b: &[u8], o: usize) -> u64 { u64::from_le_bytes(b[o..o + 8].try_into().
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     #[test]
     fn maps_rds5_codec_flags_to_directstorage_modes() {
         assert_eq!(codec_mode(0x00), Some(0)); assert_eq!(codec_mode(0x04), Some(1));
@@ -188,6 +189,42 @@ mod tests {
         assert_eq!(codec_mode(0x1c), Some(7)); assert_eq!(codec_mode(0x20), Some(0));
         assert_eq!(codec_mode(0x24), None);
     }
+    #[test]
+    fn parses_rds5_chunk_ranges_and_etpf_texture_metadata() {
+        let mut bytes = vec![0u8; 0x400];
+        bytes[..4].copy_from_slice(b"RDS5");
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&0x5000u32.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0x1c00_0002u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&0u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&3u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(&1u32.to_le_bytes());
+        bytes[0x100..0x104].copy_from_slice(b"ETPF");
+        bytes[0x108..0x10c].copy_from_slice(&1u32.to_le_bytes());
+        let d0 = 255u32 | (127u32 << 14) | (6u32 << 28);
+        let d1 = 98u32 << 3;
+        bytes[0x110..0x114].copy_from_slice(&d0.to_le_bytes());
+        bytes[0x114..0x118].copy_from_slice(&d1.to_le_bytes());
+        bytes[0x118..0x120].copy_from_slice(&0u64.to_le_bytes());
+        bytes[0x120..0x128].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+
+        let len = bytes.len() as u64;
+        let mut cursor = Cursor::new(bytes);
+        let store = Store::parse(&mut cursor, "synthetic.ttpf".into(), len).unwrap();
+        assert_eq!(store.chunks.len(), 1);
+        assert_eq!(store.chunks[0].file_offset, 0x200);
+        assert_eq!(store.chunks[0].stored_len, 0x100);
+        assert_eq!(store.chunks[0].virtual_offset, 0x1000);
+        assert_eq!(store.chunks[0].virtual_len, 0x4000);
+        assert_eq!(store.chunks[0].codec, 0x1c);
+        assert_eq!(store.textures.len(), 1);
+        assert_eq!(store.textures[0].hash, 0x1122_3344_5566_7788);
+        assert_eq!((store.textures[0].width, store.textures[0].height), (256, 128));
+        assert_eq!(store.textures[0].dxgi_format, 98);
+        assert_eq!(store.textures[0].virtual_offset, 0x1000);
+        assert_eq!(store.textures[0].mips_field(), 7);
+    }
+
     #[test]
     fn runtime_base_requires_an_exact_chunk_request() {
         let runtime = RuntimeStore {
