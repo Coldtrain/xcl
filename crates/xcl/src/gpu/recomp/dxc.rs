@@ -457,6 +457,7 @@ pub fn wait_for_memory() -> MemorySlot {
 fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
     static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
     POOL.get_or_init(|| {
+        crate::xlog_info!("DXC: starting {} compiler workers (XCL_DXC_THREADS)", compile_threads());
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
         for k in 0..compile_threads() {
