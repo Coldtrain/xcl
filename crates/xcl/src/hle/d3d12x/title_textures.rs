@@ -100,10 +100,18 @@ fn map_page_alias_range_with_stride(destination: usize, source: usize, pages: us
         || (source != 0 && pages.checked_mul(GPU_PAGE_SIZE).and_then(|n| source.checked_add(n)).is_none())
     { return false; }
     let changed = GPU_PAGE_ALIASES.lock().unwrap_or_else(|e| e.into_inner()).set_range(destination, source, pages, source_stride);
-    if changed {
-        note_page_mapping_changed(destination, destination + pages * GPU_PAGE_SIZE);
-    }
+    let _ = changed;
     true
+}
+
+/// A queue batch can reuse the same pool address after its physical backing changed. Notify
+/// the destination even when its source pointer is identical (range type 3 also reaches here).
+pub(super) fn note_page_alias_range_changed(destination: usize, pages: usize) {
+    if let Some(len) = pages.checked_mul(GPU_PAGE_SIZE) {
+        if let Some(end) = destination.checked_add(len) {
+            note_page_mapping_changed(destination, end);
+        }
+    }
 }
 
 /// Mark resources whose destination overlaps a changed mapping for a fresh upload.
