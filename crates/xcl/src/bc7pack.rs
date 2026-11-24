@@ -329,20 +329,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_table_has_expected_mode_coverage() {
+    fn header_table_covers_each_mode_without_duplicate_configurations() {
         let t = tables();
+        let mut seen = std::collections::HashSet::new();
         let mut per_mode = [0usize; 8];
-        for row in t.headers {
-            for h in row.into_iter().flatten() {
-                assert!(h.0 < 8 && h.1 < 4 && h.2 < 2);
-                per_mode[h.0 as usize] += 1;
+        for a in 0..32 {
+            for b in 0..32 {
+                if let Some((mode, rot, isel, part)) = t.headers[a][b] {
+                    assert!(mode < 8 && rot < 4 && isel < 2);
+                    assert!((part as usize) < if mode == 0 { 16 } else { 64 });
+                    assert!(seen.insert((mode, rot, isel, part)), "duplicate header");
+                    per_mode[mode as usize] += 1;
+                }
             }
         }
         assert_eq!(per_mode, [16, 64, 64, 64, 8, 4, 1, 64]);
     }
 
     #[test]
-    fn every_mode_packs_to_a_bc7_block() {
+    fn every_mode_produces_a_valid_standard_bc7_block() {
         for mode in 0..8u8 {
             let f = Fields { mode, ..Default::default() };
             assert!(pack(&f).is_some(), "mode {mode}");
@@ -350,9 +355,131 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_short_streams_and_overflowing_block_counts_fail_cleanly() {
+    fn normalization_preserves_pixels_for_every_mode_rotation_and_index_selection() {
+        for mode in 0..8u8 {
+            let m = &MODES[mode as usize];
+            for rotation in 0..=m.rb as u8 {
+                for isel in 0..=m.isb as u8 {
+                    let mut f = Fields {
+                        mode,
+                        rotation,
+                        isel,
+                        partition: if m.pb > 0 { 13 } else { 0 },
+                        ..Default::default()
+                    };
+                    for subset in 0..3 {
+                        for endpoint in 0..2 {
+                            for channel in 0..4 {
+                                let bits = if channel == 3 { m.ab } else { m.cb };
+                                if bits > 0 {
+                                    f.ep[subset][endpoint][channel] =
+                                        ((subset * 7 + endpoint * 13 + channel * 5 + 3) as u32
+                                            % (1u32 << bits)) as u8;
+                                }
+                            }
+                        }
+                        f.p[subset] = [1, 0];
+                    }
+                    for pixel in 0..16 {
+                        f.idx[0][pixel] = ((pixel * 5 + 3) as u32 % (1u32 << m.ib)) as u8;
+                        if m.ib2 > 0 {
+                            f.idx[1][pixel] =
+                                ((pixel * 3 + 1) as u32 % (1u32 << m.ib2)) as u8;
+                        }
+                    }
+                    let anchors = anchors(m.ns, f.partition as usize);
+                    for &anchor in &anchors[..m.ns] {
+                        f.idx[0][anchor] |= 1 << (m.ib - 1);
+                    }
+                    if m.ib2 > 0 {
+                        f.idx[1][0] |= 1 << (m.ib2 - 1);
+                    }
+
+                    let before: Vec<_> = (0..16).map(|p| eval_pixel(&f, p)).collect();
+                    let mut normalized = f;
+                    normalize(&mut normalized);
+                    let after: Vec<_> = (0..16).map(|p| eval_pixel(&normalized, p)).collect();
+                    assert_eq!(after, before, "mode {mode}, rotation {rotation}, isel {isel}");
+                    assert!(pack(&normalized).is_some(), "normalized mode {mode}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anchor_with_top_bit_is_rejected_by_the_block_packer() {
+        let mut f = Fields { mode: 6, ..Default::default() };
+        f.idx[0][0] = 8;
+        assert!(pack(&f).is_none());
+    }
+
+    #[test]
+    fn short_streams_and_overflowing_block_counts_fail_cleanly() {
         assert!(decode(&[], 1).is_none());
         assert!(decode(&[], 0).is_none());
         assert!(decode(&[], usize::MAX).is_none());
+        if let Some(decoded) = decode(&[0u8; 64], 4) {
+            assert_eq!(decoded.blocks.len(), 64);
+        }
+    }
+
+    /// Straight BC7 pixel evaluation of unpacked fields (no anchor rules).
+    fn eval_pixel(f: &Fields, pixel: usize) -> [u8; 4] {
+        const W2: [u32; 4] = [0, 21, 43, 64];
+        const W3: [u32; 8] = [0, 9, 18, 27, 37, 46, 55, 64];
+        const W4: [u32; 16] = [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64];
+        let weight = |bits: u32, index: u8| match bits {
+            2 => W2[index as usize],
+            3 => W3[index as usize],
+            _ => W4[index as usize],
+        };
+        let m = &MODES[f.mode as usize];
+        let subset = subset_of(m.ns, f.partition as usize, pixel);
+        let mut endpoints = [[0u32; 4]; 2];
+        for endpoint in 0..2 {
+            for channel in 0..4 {
+                let (mut value, mut bits) = (
+                    f.ep[subset][endpoint][channel] as u32,
+                    if channel == 3 { m.ab } else { m.cb },
+                );
+                if bits == 0 {
+                    endpoints[endpoint][channel] = 255;
+                    continue;
+                }
+                if m.pbit != 0 {
+                    let pbit = if m.pbit == 2 { f.p[subset][0] } else { f.p[subset][endpoint] };
+                    value = (value << 1) | pbit as u32;
+                    bits += 1;
+                }
+                value <<= 8 - bits;
+                endpoints[endpoint][channel] = value | (value >> bits);
+            }
+        }
+        let (colour_index, colour_bits, alpha_index, alpha_bits) = if m.ib2 > 0 {
+            if f.isel == 1 {
+                (f.idx[1][pixel], m.ib2, f.idx[0][pixel], m.ib)
+            } else {
+                (f.idx[0][pixel], m.ib, f.idx[1][pixel], m.ib2)
+            }
+        } else {
+            (f.idx[0][pixel], m.ib, f.idx[0][pixel], m.ib)
+        };
+        let mut out = [0u8; 4];
+        for channel in 0..4 {
+            let w = if channel == 3 {
+                weight(alpha_bits, alpha_index)
+            } else {
+                weight(colour_bits, colour_index)
+            };
+            out[channel] =
+                (((64 - w) * endpoints[0][channel] + w * endpoints[1][channel] + 32) >> 6) as u8;
+        }
+        if m.ab == 0 {
+            out[3] = 255;
+        }
+        if f.rotation > 0 {
+            out.swap(f.rotation as usize - 1, 3);
+        }
+        out
     }
 }
