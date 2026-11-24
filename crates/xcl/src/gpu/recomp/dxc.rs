@@ -416,12 +416,32 @@ pub fn wait_for_memory() -> MemorySlot {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let start = std::time::Instant::now();
+    let mut available_pagefile = 0u64;
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
-        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
+        let status_ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+        if status_ok {
+            available_pagefile = m.ullAvailPageFile;
+        }
+        let active = WORKING.load(Ordering::Acquire);
+        let reserve = RESERVE_GB.load(Ordering::Relaxed);
+        let need = (reserve << 30) + ((active as u64) << 30);
+        let plenty = !status_ok || available_pagefile >= need;
         if plenty || start.elapsed().as_secs() >= 60 {
+            let waited = start.elapsed();
+            if waited >= std::time::Duration::from_secs(2) {
+                static WARNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if WARNED.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_warn!(
+                        "DXC: compile admission waited {:.1}s for commit headroom (available pagefile {:.1} GiB, reserve {} GiB, active compiles {})",
+                        waited.as_secs_f64(),
+                        available_pagefile as f64 / (1u64 << 30) as f64,
+                        reserve,
+                        active
+                    );
+                }
+            }
             WORKING.fetch_add(1, Ordering::AcqRel);
             return MemorySlot;
         }
