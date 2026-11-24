@@ -2759,6 +2759,16 @@ pub(super) unsafe fn create_raw_pc_command_list(
         }
         hr
     };
+    if hr < 0 || out.is_null() {
+        let removed = ID3D12Device::from_raw_borrowed(&dev)
+            .and_then(|d| d.GetDeviceRemovedReason().err())
+            .map_or_else(|| "S_OK".to_owned(), |e| format!("{:#x}", e.code().0 as u32));
+        crate::xlog_warn!(
+            "D3D12.X: internal CreateCommandList(type {}, allocator {alloc:#x}, initial PSO {init_pso:#x}) failed: HRESULT {:#x}, device-removed reason {removed}",
+            ty.0,
+            hr as u32
+        );
+    }
     (hr >= 0 && !out.is_null()).then_some(out)
 }
 
@@ -3929,6 +3939,10 @@ unsafe fn go_background(
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
             out as usize
         } else {
+            crate::xlog_warn!(
+                "D3D12.X: background {} PSO build failed (shader key {key:016x})",
+                if compute { "compute" } else { "graphics" }
+            );
             0
         }
     });
