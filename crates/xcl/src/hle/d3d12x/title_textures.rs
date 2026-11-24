@@ -40,6 +40,138 @@ extern "system" {
 
 /// (device, address its bytes are read from, layout, states) of an upload
 type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
+/// The title's queue page-pool mappings: GPU-view destination page → CPU-readable pool page.
+/// XCL keeps title textures as detiled D3D12 resources, so it resolves these aliases while
+/// reading the title's memory rather than remapping Windows virtual memory.
+const GPU_PAGE_SIZE: usize = 64 << 10;
+
+#[derive(Default)]
+struct PageAliases {
+    pages: BTreeMap<usize, usize>,
+}
+
+impl PageAliases {
+    fn source(&self, va: usize) -> Option<usize> {
+        let page = va & !(GPU_PAGE_SIZE - 1);
+        self.pages.get(&page).map(|&src| src + (va - page))
+    }
+
+    fn overlaps(&self, start: usize, end: usize) -> bool {
+        if end <= start { return false; }
+        if let Some((&page, _)) = self.pages.range(..=start).next_back() {
+            if page.saturating_add(GPU_PAGE_SIZE) > start { return true; }
+        }
+        self.pages.range(start..end).next().is_some()
+    }
+
+    fn set_range(&mut self, destination: usize, source: usize, pages: usize, source_stride: usize) -> bool {
+        let mut changed = false;
+        for i in 0..pages {
+            let dst = destination + i * GPU_PAGE_SIZE;
+            if source == 0 {
+                changed |= self.pages.remove(&dst).is_some();
+            } else {
+                let src = source + i * source_stride;
+                if self.pages.insert(dst, src) != Some(src) { changed = true; }
+            }
+        }
+        changed
+    }
+}
+
+static GPU_PAGE_ALIASES: Mutex<PageAliases> = Mutex::new(PageAliases { pages: BTreeMap::new() });
+
+/// Apply one console CopyPageMappingsBatchX range (64 KiB pages). A zero source unmaps.
+pub(super) fn map_page_alias_range(destination: usize, source: usize, pages: usize) -> bool {
+    map_page_alias_range_with_stride(destination, source, pages, GPU_PAGE_SIZE)
+}
+
+/// Map every destination page to the same source page (range type 1).
+pub(super) fn map_repeated_page_alias_range(destination: usize, source: usize, pages: usize) -> bool {
+    map_page_alias_range_with_stride(destination, source, pages, 0)
+}
+
+fn map_page_alias_range_with_stride(destination: usize, source: usize, pages: usize, source_stride: usize) -> bool {
+    if pages == 0
+        || destination == 0
+        || destination % GPU_PAGE_SIZE != 0
+        || (source != 0 && source % GPU_PAGE_SIZE != 0)
+        || pages.checked_mul(GPU_PAGE_SIZE).and_then(|n| destination.checked_add(n)).is_none()
+        || (source != 0 && pages.checked_mul(GPU_PAGE_SIZE).and_then(|n| source.checked_add(n)).is_none())
+    { return false; }
+    let changed = GPU_PAGE_ALIASES.lock().unwrap_or_else(|e| e.into_inner()).set_range(destination, source, pages, source_stride);
+    if changed {
+        note_page_mapping_changed(destination, destination + pages * GPU_PAGE_SIZE);
+    }
+    true
+}
+
+/// Mark resources whose destination overlaps a changed mapping for a fresh upload.
+fn note_page_mapping_changed(destination: usize, end: usize) {
+    let mut t = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    for e in t.by_res.values_mut() {
+        if e.va < end && destination < e.va.saturating_add(e.tex.size() as usize) {
+            e.src = mirror_source(e.va);
+            if e.gpu_written { e.gpu_written = false; GPU_WRITTEN.fetch_sub(1, Ordering::Relaxed); }
+            if !e.pending { e.pending = true; PENDING.fetch_add(1, Ordering::Relaxed); }
+        }
+    }
+    // Shadowed placements are not counted as pending until they become active.
+    for e in t.shadowed.values_mut() {
+        if e.va < end && destination < e.va.saturating_add(e.tex.size() as usize) {
+            e.src = mirror_source(e.va);
+            if e.gpu_written { e.gpu_written = false; GPU_WRITTEN.fetch_sub(1, Ordering::Relaxed); }
+            e.pending = true;
+        }
+    }
+    drop(t);
+    TEXTURES_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// Forget all GPU aliases backed by a page pool being unregistered.
+pub(super) fn unmap_page_pool_aliases(pool: usize, pages: usize) {
+    let Some(size) = pages.checked_mul(GPU_PAGE_SIZE) else { return };
+    let Some(pool_end) = pool.checked_add(size) else { return };
+    let mut destinations: Vec<usize> = {
+        let mut aliases = GPU_PAGE_ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+        let stale: Vec<usize> = aliases.pages.iter().filter_map(|(&dst, &src)| (src >= pool && src < pool_end).then_some(dst)).collect();
+        for dst in &stale { aliases.pages.remove(dst); }
+        stale
+    };
+    destinations.sort_unstable();
+    let mut i = 0;
+    while i < destinations.len() {
+        let start = destinations[i];
+        let mut end = start + GPU_PAGE_SIZE;
+        i += 1;
+        while i < destinations.len() && destinations[i] == end {
+            end += GPU_PAGE_SIZE;
+            i += 1;
+        }
+        note_page_mapping_changed(start, end);
+    }
+}
+/// Source segments of a title range: (offset in destination, readable source, length).
+/// Adjacent physical pages are coalesced; repeated-page mappings remain separate segments.
+fn source_segments(va: usize, len: usize) -> Vec<(usize, usize, usize)> {
+    if len == 0 { return Vec::new(); }
+    let end = va.saturating_add(len);
+    let aliases = GPU_PAGE_ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    if !aliases.overlaps(va, end) { return vec![(0, mirror_source_unmapped(va), len)]; }
+    let mut out: Vec<(usize, usize, usize)> = Vec::new();
+    let mut offset = 0usize;
+    while offset < len {
+        let at = va + offset;
+        let n = (GPU_PAGE_SIZE - (at & (GPU_PAGE_SIZE - 1))).min(len - offset);
+        let src = aliases.source(at).unwrap_or_else(|| mirror_source_unmapped(at));
+        match out.last_mut() {
+            Some((_, last_src, last_len)) if last_src.saturating_add(*last_len) == src => *last_len += n,
+            _ => out.push((offset, src, n)),
+        }
+        offset += n;
+    }
+    out
+}
 
 struct Entry {
     device: usize,
@@ -400,10 +532,13 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
 /// when nothing is mapped at `va` itself, else `va`. A physical page mapped at `va` counts
 /// before its first use too, while it is still reserved memory (`kernelx::physical_page_at`).
 fn mirror_source(va: usize) -> usize {
+    GPU_PAGE_ALIASES.lock().unwrap_or_else(|e| e.into_inner()).source(va).unwrap_or_else(|| mirror_source_unmapped(va))
+}
+
+/// The ordinary B → A mirror when no queue page-pool mapping overrides this page.
+fn mirror_source_unmapped(va: usize) -> usize {
     let Some(src) = crate::hle::kernelx::mirrors::source(va) else { return va };
-    if crate::hle::kernelx::physical_page_at(va) {
-        return va;
-    }
+    if crate::hle::kernelx::physical_page_at(va) { return va; }
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let mapped = unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT;
@@ -632,7 +767,14 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES
+        .lock()
+        .unwrap()
+        .by_res
+        .values()
+        .flat_map(|e| source_segments(e.va, e.tex.size() as usize))
+        .map(|(_, src, len)| (src & !0xFFF, (src + len + 0xFFF) & !0xFFF))
+        .collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
@@ -763,8 +905,10 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 if e.gpu_written {
                     return false;
                 }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                source_segments(e.va, e.tex.size() as usize).iter().any(|&(_, src, len)| {
+                    let i = dirty.partition_point(|&p| p.saturating_add(page as usize) <= src);
+                    dirty.get(i).is_some_and(|&p| p < src.saturating_add(len))
+                })
             })
             .filter_map(|(&res, e)| {
                 if e.pending {
@@ -772,7 +916,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });
@@ -916,7 +1060,7 @@ pub unsafe fn probe_gpu_content(res: usize) {
         }
         g.push(res);
     }
-    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.device, e.src, Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.device, e.va, Arc::clone(&e.tex), e.gpu_written)) else { return };
     let d = device as *mut c_void;
     let r = res as *mut c_void;
     let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
@@ -1147,11 +1291,19 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
 /// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
 /// as much as the detile of a video frame), else read page run by page run.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
-        std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
-    } else {
-        std::borrow::Cow::Owned(read_committed(at, len))
+    let segments = source_segments(at, len);
+    if segments.len() == 1 {
+        let (_, src, size) = segments[0];
+        if size == len && crate::gpu::shader::readable(src, len) {
+            return std::borrow::Cow::Borrowed(std::slice::from_raw_parts(src as *const u8, len));
+        }
     }
+    let mut out = vec![0u8; len];
+    for (offset, src, size) in segments {
+        let bytes = read_committed(src, size);
+        out[offset..offset + size].copy_from_slice(&bytes);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
@@ -1178,6 +1330,21 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn page_pool_aliases_support_contiguous_repeated_and_unmapped_ranges() {
+        let mut aliases = PageAliases::default();
+        let (dst, src) = (0x1000_0000usize, 0x2000_0000usize);
+        assert!(aliases.set_range(dst, src, 3, GPU_PAGE_SIZE));
+        assert_eq!(aliases.source(dst + 0x1234), Some(src + 0x1234));
+        assert_eq!(aliases.source(dst + GPU_PAGE_SIZE + 0x20), Some(src + GPU_PAGE_SIZE + 0x20));
+        assert!(aliases.set_range(dst + 3 * GPU_PAGE_SIZE, src, 2, 0));
+        assert_eq!(aliases.source(dst + 3 * GPU_PAGE_SIZE + 0x55), Some(src + 0x55));
+        assert_eq!(aliases.source(dst + 4 * GPU_PAGE_SIZE + 0x55), Some(src + 0x55));
+        assert!(aliases.overlaps(dst + 0x100, dst + 4 * GPU_PAGE_SIZE));
+        assert!(aliases.set_range(dst + GPU_PAGE_SIZE, 0, 1, GPU_PAGE_SIZE));
+        assert_eq!(aliases.source(dst + GPU_PAGE_SIZE), None);
+        assert_eq!(aliases.source(dst), Some(src));
+    }
     /// A texture is left out only when its memory hashes as at its own last upload, and a
     /// texture that was forgotten (released, or its address registered again) is uploaded again.
     #[test]
