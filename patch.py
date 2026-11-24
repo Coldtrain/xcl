@@ -1,7 +1,7 @@
 
 #!/usr/bin/env python3
 """
-Patch GTA VI intentional null writes and identified debug breakpoints.
+Patch game intentional null writes and identified debug breakpoints.
 
 Usage:
     python patch_null_write.py game_scarlett_master.exe
