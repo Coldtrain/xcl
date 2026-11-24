@@ -160,11 +160,19 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     if send {
         let _ = queue().lock().unwrap().send(p);
     } else if used::known(key) {
-        if preload_max() != 0 && PRELOAD_CLAIMED.load(Ordering::Acquire) < preload_max() {
+        // Reserve the slot when enqueueing, not when a worker eventually dequeues it.
+        // Otherwise submit_as can queue the entire history before any worker increments
+        // PRELOAD_CLAIMED, defeating the cap and retaining every speculative job.
+        if preload_max() != 0 && claim_preload() {
             if let Some(q) = preload() {
                 q.list.lock().unwrap().push_back(p);
                 q.cv.notify_one();
             }
+        } else if preload_max() != 0 {
+            static CAP_LOGGED: std::sync::Once = std::sync::Once::new();
+            CAP_LOGGED.call_once(|| {
+                crate::xlog_info!("D3D12.X: speculative PSO preload reached its {}-pipeline enqueue cap; remaining pipelines will build on demand", preload_max());
+            });
         }
     }
 }
@@ -340,10 +348,6 @@ fn preload() -> Option<&'static Preload> {
                     }
                     if !preload_has_commit_headroom() {
                         crate::xlog_warn!("D3D12.X: stopping speculative PSO preload: available system commit fell below the reserve; remaining pipelines will build on demand");
-                        break;
-                    }
-                    if !claim_preload() {
-                        crate::xlog_info!("D3D12.X: speculative PSO preload reached its {}-pipeline cap; remaining pipelines will build on demand", preload_max());
                         break;
                     }
                     // (None: a bind took it and builds it itself)
