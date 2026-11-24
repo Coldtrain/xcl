@@ -15,7 +15,7 @@ pub mod gpu;
 pub mod bc6pack;
 mod bc1pack;
 mod bc5pack;
-mod bc7pack;
+pub mod bc7pack;
 mod bcpack_rans;
 pub mod hle;
 pub mod hooks;
