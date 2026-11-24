@@ -504,7 +504,19 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
 /// has been held 30 s.
 fn wait_budget() -> Option<std::time::Duration> {
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
+    *B.get_or_init(|| {
+        let budget = std::env::var("XCL_PSO_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(std::time::Duration::from_millis);
+        if let Some(ms) = budget.map(|d| d.as_millis()) {
+            crate::xlog_warn!(
+                "D3D12.X: XCL_PSO_WAIT_MS={ms} is a hard compute-PSO wait budget; a compute pipeline still building at the deadline is skipped, so its GPU writes and dependent Wait64 signals will not happen. Unset this variable for correctness."
+            );
+        }
+        budget
+    })
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
