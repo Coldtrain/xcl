@@ -1204,9 +1204,13 @@ mod tests {
             blocks[i * 16..(i + 1) * 16].fill((i & 0xff) as u8);
         }
         let linear = bc7_stream_to_linear(&chain, level, 0, &blocks).unwrap();
+        let layout = &chain.layout;
+        let origin = l.origin;
+        let pitch = l.pitch;
+        let level_offset = l.offset;
         let mut expected_order: Vec<(usize, usize)> = (0..l.height)
             .flat_map(|y| (0..l.width).map(move |x| {
-                (l.offset + chain.layout.offset_z(x + l.origin.0, y + l.origin.1, 0, l.pitch), y * l.width + x)
+                (level_offset + layout.offset_z(x + origin.0, y + origin.1, 0, pitch), y * l.width + x)
             }))
             .collect();
         expected_order.sort_unstable_by_key(|x| x.0);

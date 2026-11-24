@@ -1,6 +1,6 @@
 //! Generated BC7 partition, header and fitted history tables.
 //! Ported from holdmysocks/SixNG `bc7pack_tables.rs` (GPL-3.0-only,
-//! upstream commit 9b38e3c0245a7cacd4d04d7f6671521c14111b5e).
+//! upstream commit b57cdb036839c559d60da648925239d25dbb3ee9).
 // Generated tables for the BCPack BC7 decoder.
 
 /// BC7 anchor index of subset 1 in 2-subset partitions (BPTC specification).
