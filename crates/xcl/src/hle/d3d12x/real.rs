@@ -3812,19 +3812,20 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    let submit = if super::pso_async::lazy() { super::pso_async::submit_lazy } else { super::pso_async::submit };
-    submit(
-        *ppv as usize,
-        compute,
-        Box::new(move || {
-            let mut out: *mut c_void = std::ptr::null_mut();
-            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-                out as usize
-            } else {
-                0
-            }
-        }),
-    );
+    let key = owned.shaders_key();
+    let job: super::pso_async::Job = Box::new(move || {
+        let mut out: *mut c_void = std::ptr::null_mut();
+        if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+            out as usize
+        } else {
+            0
+        }
+    });
+    if super::pso_async::lazy() {
+        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+    } else {
+        super::pso_async::submit(*ppv as usize, compute, job);
+    }
     Some(hr)
 }
 
