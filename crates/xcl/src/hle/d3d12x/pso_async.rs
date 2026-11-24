@@ -160,9 +160,11 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     if send {
         let _ = queue().lock().unwrap().send(p);
     } else if used::known(key) {
-        if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(p);
-            q.cv.notify_one();
+        if preload_max() != 0 && PRELOAD_CLAIMED.load(Ordering::Acquire) < preload_max() {
+            if let Some(q) = preload() {
+                q.list.lock().unwrap().push_back(p);
+                q.cv.notify_one();
+            }
         }
     }
 }
@@ -250,6 +252,57 @@ struct Preload {
     cv: Condvar,
 }
 
+/// Maximum number of speculative pipeline objects retained by preload. Unlike DXC's
+/// temporary compiler allocations, completed driver PSOs remain resident. Bound this
+/// independently so a large used-pipeline history cannot consume the process commit.
+/// Set XCL_PSO_PRELOAD_MAX to raise/lower the cap (0 disables speculative preloading).
+fn preload_max() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("XCL_PSO_PRELOAD_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4096)
+            .min(1_000_000)
+    })
+}
+
+static PRELOAD_CLAIMED: AtomicUsize = AtomicUsize::new(0);
+
+/// Claim one slot atomically; workers cannot race past the process-wide preload cap.
+fn claim_preload() -> bool {
+    let max = preload_max();
+    let mut current = PRELOAD_CLAIMED.load(Ordering::Acquire);
+    loop {
+        if current >= max {
+            return false;
+        }
+        match PRELOAD_CLAIMED.compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// A driver PSO is persistent, so DXC's compile-memory admission guard cannot protect it.
+/// Stop speculative work before the system runs short of commit; unbuilt pipelines remain
+/// lazy and are created on demand by the title.
+fn preload_has_commit_headroom() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        // If Windows cannot report commit, retain the hard count cap rather than
+        // disabling preload entirely.
+        return true;
+    }
+    let reserve_gb = std::env::var("XCL_PSO_PRELOAD_RESERVE_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(8);
+    m.ullAvailPageFile >= reserve_gb.saturating_mul(1u64 << 30)
+}
+
 fn preload() -> Option<&'static Preload> {
     static Q: OnceLock<Option<Preload>> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -263,6 +316,7 @@ fn preload() -> Option<&'static Preload> {
         .as_ref()?;
     STARTED.call_once(|| {
         let n = (worker_threads() / 4).clamp(2, 4);
+        crate::xlog_info!("D3D12.X: PSO preload enabled (max {} speculative PSOs, {} GiB commit reserve, {} workers)", preload_max(), std::env::var("XCL_PSO_PRELOAD_RESERVE_GB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(8), n);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 unsafe {
@@ -283,6 +337,14 @@ fn preload() -> Option<&'static Preload> {
                     // (released by the title meanwhile)
                     if p.orphan.load(Ordering::Acquire) {
                         continue;
+                    }
+                    if !preload_has_commit_headroom() {
+                        crate::xlog_warn!("D3D12.X: stopping speculative PSO preload: available system commit fell below the reserve; remaining pipelines will build on demand");
+                        break;
+                    }
+                    if !claim_preload() {
+                        crate::xlog_info!("D3D12.X: speculative PSO preload reached its {}-pipeline cap; remaining pipelines will build on demand", preload_max());
+                        break;
                     }
                     // (None: a bind took it and builds it itself)
                     let job = p.job.lock().unwrap().take();
