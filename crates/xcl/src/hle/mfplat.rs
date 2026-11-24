@@ -451,7 +451,6 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         // A relative path.
         return Ok(with_nul(url));
     };
-    let wide: Vec<u16> = path.encode_utf16().collect();
     Ok({
         let host_path = crate::vfs::get()
             .and_then(|v| v.real_path_for_read(&path))
