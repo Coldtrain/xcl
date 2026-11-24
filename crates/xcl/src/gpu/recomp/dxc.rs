@@ -397,6 +397,28 @@ pub fn set_memory_reserve(gb: u64) {
 
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
 static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// DXC workers admitted to the pool but still waiting for commit headroom.
+static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct MemoryWaiter;
+
+impl MemoryWaiter {
+    fn start() -> Self {
+        WAITING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for MemoryWaiter {
+    fn drop(&mut self) {
+        WAITING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Number of DXC workers currently blocked on commit headroom.
+pub fn waiting_for_memory_count() -> usize {
+    WAITING.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// A compile let in by `wait_for_memory`, until it is dropped.
 pub struct MemorySlot;
@@ -407,14 +429,15 @@ impl Drop for MemorySlot {
     }
 }
 
-/// Before a compile: with 6 GB of commit left or more, plus 1 GB for every compile already
-/// running (each can still grow to ~0.7 GB), at once; with less, one compile at a
-/// time – it goes when no other is running (and after a minute in any case). Each compile used
-/// to wait the minute while commit was short: with XDefiant's own 10 GB committed, 4 GB were
-/// left, and its last cold-cache shaders came a few a minute.
+/// Before a compile: reserve 6 GB plus approximately 1 GB for each admitted compile.
+/// Admission is atomic: workers must re-check the active count after another worker enters,
+/// otherwise a burst can all observe the same free-commit snapshot and over-admit at once.
+/// If commit stays low for a minute, allow one compile at a time rather than admitting the
+/// entire waiting pool and potentially driving the process into paging or allocation failure.
 pub fn wait_for_memory() -> MemorySlot {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let _waiting = MemoryWaiter::start();
     let start = std::time::Instant::now();
     let mut available_pagefile = 0u64;
     loop {
@@ -426,27 +449,30 @@ pub fn wait_for_memory() -> MemorySlot {
         }
         let active = WORKING.load(Ordering::Acquire);
         let reserve = RESERVE_GB.load(Ordering::Relaxed);
-        let need = (reserve << 30) + ((active as u64) << 30);
+        let need = (reserve << 30).saturating_add(((active as u64) + 1) << 30);
         let plenty = !status_ok || available_pagefile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 {
-            let waited = start.elapsed();
-            if waited >= std::time::Duration::from_secs(2) {
-                static WARNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                if WARNED.fetch_add(1, Ordering::Relaxed) < 8 {
-                    crate::xlog_warn!(
-                        "DXC: compile admission waited {:.1}s for commit headroom (available pagefile {:.1} GiB, reserve {} GiB, active compiles {})",
-                        waited.as_secs_f64(),
-                        available_pagefile as f64 / (1u64 << 30) as f64,
-                        reserve,
-                        active
-                    );
+        let timed_out = start.elapsed() >= std::time::Duration::from_secs(60);
+        if plenty || (timed_out && active == 0) {
+            // Revalidate the active count atomically. Another worker may have entered since
+            // GlobalMemoryStatusEx returned; never let a stale snapshot admit an unbounded burst.
+            if WORKING.compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                let waited = start.elapsed();
+                if waited >= std::time::Duration::from_secs(2) {
+                    static WARNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    if WARNED.fetch_add(1, Ordering::Relaxed) < 8 {
+                        crate::xlog_warn!(
+                            "DXC: compile admission waited {:.1}s for commit headroom (available pagefile {:.1} GiB, reserve {} GiB, active compiles {})",
+                            waited.as_secs_f64(),
+                            available_pagefile as f64 / (1u64 << 30) as f64,
+                            reserve,
+                            active
+                        );
+                    }
                 }
+                drop(_waiting);
+                return MemorySlot;
             }
-            WORKING.fetch_add(1, Ordering::AcqRel);
-            return MemorySlot;
-        }
-        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            return MemorySlot;
+            continue;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
