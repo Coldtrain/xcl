@@ -74,13 +74,27 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-/// Number of workers that build complete D3D12 pipeline objects. DXC has its own pool; keeping\n/// this independently tunable helps distinguish driver/PSO contention from DXC throughput.\npub fn worker_threads() -> usize {\n    static N: OnceLock<usize> = OnceLock::new();\n    *N.get_or_init(|| {\n        std::env::var(\"XCL_PSO_THREADS\")\n            .ok()\n            .and_then(|v| v.trim().parse::<usize>().ok())\n            .unwrap_or_else(crate::gpu::recomp::dxc::compile_threads)\n            .clamp(1, 64)\n    })\n}\n\nfn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+/// Number of workers that build complete D3D12 pipeline objects. DXC has its own pool; keeping
+/// this independently tunable helps distinguish driver/PSO contention from DXC throughput.
+pub fn worker_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("XCL_PSO_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(crate::gpu::recomp::dxc::compile_threads)
+            .clamp(1, 64)
+    })
+}
+
+fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
     Q.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Arc<Pending>>();
         let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
+        // Translation recurses deeply on big programs; DXC itself runs on its own pool.
+        let n = worker_threads();
+        crate::xlog_info!("D3D12.X: starting {n} PSO workers (DXC workers: {})", crate::gpu::recomp::dxc::compile_threads());
         for k in 0..n {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
