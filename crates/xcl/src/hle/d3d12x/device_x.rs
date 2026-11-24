@@ -594,6 +594,11 @@ pub(super) unsafe extern "system" fn set_debug_flags_x(_this: *mut c_void, _flag
 
 static PAGE_POOLS: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
 
+/// Whether a queue page-mapping request references a page pool registered through device slot 74.
+pub(super) fn is_registered_page_pool(address: u64, pages: u32) -> bool {
+    PAGE_POOLS.lock().unwrap_or_else(|e| e.into_inner()).contains(&(address, pages))
+}
+
 /// device #74 RegisterPagePoolX(address, pages, index out)
 pub(super) unsafe extern "system" fn register_page_pool_x(_this: *mut c_void, va: u64, pages: u32, out: *mut u32) -> HRESULT {
     if va == 0 || pages == 0 {
@@ -614,6 +619,7 @@ pub(super) unsafe extern "system" fn register_page_pool_x(_this: *mut c_void, va
 pub(super) unsafe extern "system" fn unregister_page_pool_x(_this: *mut c_void, index: u64) -> HRESULT {
     match PAGE_POOLS.lock().unwrap().get_mut(index as usize) {
         Some(e) if e.1 != 0 => {
+            super::title_textures::unmap_page_pool_aliases(e.0 as usize, e.1 as usize);
             *e = (0, 0);
             S_OK
         }
