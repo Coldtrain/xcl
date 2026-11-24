@@ -39,6 +39,15 @@ const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
 const MAX_SCAN: usize = 512;
 
+/// Xbox command-memory callback registered on allocator slot 9. The PC
+/// runtime/driver owns command storage, so XCL retains the title callback for
+/// allocator lifetime diagnostics but deliberately does not invoke it.
+static ALLOCATOR_CALLBACKS: OnceLock<Mutex<HashMap<usize, (usize, usize)>>> = OnceLock::new();
+
+fn allocator_callbacks() -> &'static Mutex<HashMap<usize, (usize, usize)>> {
+    ALLOCATOR_CALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Kind {
     Device,
@@ -750,15 +759,20 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         v.push(*ot.add(i));
     }
     let hook = if kind == Kind::CommandQueue { super::present::on_queue_console_method as usize } else { 0 };
+    let trace_unknown = std::env::var_os("XCL_D3D12_TRACE_UNKNOWN").is_some();
     for i in public..scanned {
         let info = stubs::new_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
-        v[1 + i] = super::guard::make_guard(v[1 + i], info);
+        v[1 + i] = if trace_unknown {
+            super::guard::make_guard_trace(v[1 + i], info)
+        } else {
+            super::guard::make_guard(v[1 + i], info)
+        };
     }
     for i in scanned..total {
         let (addr, info) = stubs::make_stub_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
-        v.push(addr);
+        v.push(if trace_unknown { super::guard::make_guard_trace(addr, info) } else { addr });
     }
     for (method, f) in overrides(kind) {
         if let Some(s) = layout::slot(iface, method) {
@@ -795,7 +809,8 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     if let Some(first) = console_extensions(kind) {
         let own: HashSet<usize> = console_slots(kind).iter().map(|e| e.0).chain(console_remap(kind).iter().map(|e| e.0)).collect();
         for i in (first..public).filter(|i| !own.contains(i)) {
-            let (stub, _) = stubs::make_stub_info(DLL, &format!("{}::#{i} (console extension)", iface.name), 0);
+            let (stub, info) = stubs::make_stub_info(DLL, &format!("{}::#{i} (console extension)", iface.name), 0);
+            let stub = if trace_unknown { super::guard::make_guard_trace(stub, info) } else { stub };
             v[1 + i] = super::guard::make_split(stub, v[1 + i]);
         }
     }
@@ -954,6 +969,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
+        Kind::CommandAllocator => vec![(9, alloc_set_command_memory_callback as usize)],
         Kind::DmaList => {
             use super::list_x as l;
             vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize)]
@@ -1022,6 +1038,11 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (93, l::kickoff_x as usize),
                 (94, l::set_depth_bias_x as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
+                (75, cl_set_unknown_75 as usize),
+                (126, cl_set_unknown_126 as usize),
+                (131, cl_write_register_x as usize),
+                (132, cl_write_register_x as usize),
+                (142, cl_set_sample_mask_x as usize),
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
             ]
@@ -4814,9 +4835,34 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        allocator_callbacks().lock().unwrap_or_else(|e| e.into_inner()).remove(&(this as usize));
         super::list_x::on_allocator_release(this as usize);
     }
     n
+}
+
+/// Xbox allocator slot 9: SetCustomAllocationCallbackX / SetOutOfMemoryCallbackX.
+/// The callback is title-owned memory allocation policy; host command allocators
+/// manage their own storage, so retain but never call the callback.
+unsafe extern "system" fn alloc_set_command_memory_callback(
+    this: *mut c_void,
+    callback: usize,
+    context: usize,
+    _flags: u64,
+) -> HRESULT {
+    let mut callbacks = allocator_callbacks().lock().unwrap_or_else(|e| e.into_inner());
+    if callback == 0 {
+        callbacks.remove(&(this as usize));
+    } else {
+        callbacks.insert(this as usize, (callback, context));
+    }
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_info!(
+            "D3D12.X: allocator {this:p} command-memory callback {callback:#x}, context {context:#x} (retained, not invoked on host)"
+        );
+    }
+    S_OK
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
@@ -4828,6 +4874,52 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
         super::console_list::allocator_reset(this);
     }
     hr
+}
+
+/// Xbox command-list register writes (slots 131 and 132). These address the
+/// console GPU's register file, which the host D3D12 driver owns; preserve the
+/// call for diagnostics without trying to write host hardware registers.
+unsafe extern "system" fn cl_write_register_x(
+    this: *mut c_void,
+    register: u32,
+    value: u32,
+    reserved: u32,
+    mask: u64,
+) {
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_info!(
+            "D3D12.X: command list {this:p} register write register={register:#x}, value={value:#x}, reserved={reserved:#x}, mask={mask:#x} (not applied to host GPU)"
+        );
+    }
+}
+
+/// Console state byte at slot 75; its bit-level meaning is not established.
+unsafe extern "system" fn cl_set_unknown_75(this: *mut c_void, value: u32) {
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if value & 0xff != 0 && LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_info!("D3D12.X: command list {this:p} slot 75 state byte={:#x} (not mapped)", value & 0xff);
+    }
+}
+
+/// Console state write at slot 126; the second argument carries two packed dwords.
+unsafe extern "system" fn cl_set_unknown_126(this: *mut c_void, value: u32, packed: u64) {
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_info!("D3D12.X: command list {this:p} slot 126 state byte={value:#x}, packed={packed:#x} (not mapped)");
+    }
+}
+
+/// Slot 142 is observed as a 64-bit sample mask. All samples enabled is the
+/// default PC PSO mask; non-default dynamic masks are reported but not emulated.
+unsafe extern "system" fn cl_set_sample_mask_x(this: *mut c_void, mask: u64) {
+    if mask == u64::MAX || mask as u32 == u32::MAX {
+        return;
+    }
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_warn!("D3D12.X: command list {this:p} slot 142 sample mask {mask:#x} is not represented by a host PSO");
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -4882,12 +4974,114 @@ fn is_fence(p: usize) -> bool {
     p != 0 && FENCES.read().unwrap_or_else(|e| e.into_inner()).contains(&p)
 }
 
+#[repr(C)]
+struct PageRangeX {
+    kind: u32,
+    start: u32,
+    count: u32,
+}
+
+#[repr(C)]
+struct PageBatchX {
+    destination: u64,
+    count: u32,
+    ranges: *const PageRangeX,
+}
+
+// The title's x64 ABI structures: 12-byte ranges and 24-byte batches (pointer at +0x10).
+const _: [(); 12] = [(); std::mem::size_of::<PageRangeX>()];
+const _: [(); 24] = [(); std::mem::size_of::<PageBatchX>()];
+
+/// Queue slot #31: CopyPageMappingsBatchX(count, batches, pool, pool_pages, flags).
+/// The title has already mapped the physical pool into its CPU view. XCL records the matching
+/// GPU-view aliases so texture uploads read the correct physical pages before the next submit.
+unsafe fn copy_page_mappings_batch_x(count: usize, batches: usize, pool: usize, pool_pages: usize, flags: usize) -> usize {
+    const PAGE: usize = 64 << 10;
+    const MAX_BATCHES: usize = 65_536;
+    const MAX_RANGES: usize = 1 << 20;
+    const E_INVALIDARG: usize = 0x8007_0057;
+    if count == 0 { return 0; }
+    if count > MAX_BATCHES || batches == 0 || pool == 0 || pool_pages == 0 || pool_pages > u32::MAX as usize {
+        crate::xlog_warn!("D3D12.X: invalid CopyPageMappingsBatchX header: batches={count}, ptr={batches:#x}, pool={pool:#x}, pool_pages={pool_pages}, flags={flags:#x}");
+        return E_INVALIDARG;
+    }
+    let Some(bytes) = count.checked_mul(std::mem::size_of::<PageBatchX>()) else { return E_INVALIDARG };
+    if batches % std::mem::align_of::<PageBatchX>() != 0 || !crate::gpu::shader::readable(batches, bytes) {
+        crate::xlog_warn!("D3D12.X: unreadable CopyPageMappingsBatchX batch array {batches:#x} ({bytes} bytes)");
+        return E_INVALIDARG;
+    }
+    if !super::device_x::is_registered_page_pool(pool as u64, pool_pages as u32) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("D3D12.X: CopyPageMappingsBatchX used an unregistered page pool; attempting validated mappings"));
+    }
+    let batches = std::slice::from_raw_parts(batches as *const PageBatchX, count);
+    let mut mapped = 0usize;
+    let mut unmapped = 0usize;
+    let mut unchanged = 0usize;
+    for batch in batches {
+        if batch.count == 0 { continue; }
+        if batch.ranges.is_null() { continue; }
+        if batch.count as usize > MAX_RANGES || (batch.ranges as usize) % std::mem::align_of::<PageRangeX>() != 0 { return E_INVALIDARG; }
+        let Some(range_bytes) = (batch.count as usize).checked_mul(std::mem::size_of::<PageRangeX>()) else { return E_INVALIDARG };
+        if !crate::gpu::shader::readable(batch.ranges as usize, range_bytes) {
+            crate::xlog_warn!("D3D12.X: unreadable CopyPageMappingsBatchX ranges at {:#x} ({range_bytes} bytes)", batch.ranges as usize);
+            return E_INVALIDARG;
+        }
+        let ranges = std::slice::from_raw_parts(batch.ranges, batch.count as usize);
+        let mut destination = batch.destination as usize;
+        if destination == 0 || destination % PAGE != 0 { return E_INVALIDARG; }
+        for range in ranges {
+            let pages = range.count as usize;
+            let Some(len) = pages.checked_mul(PAGE) else { return E_INVALIDARG };
+            let Some(next_destination) = destination.checked_add(len) else { return E_INVALIDARG };
+            if pages == 0 { destination = next_destination; continue; }
+            let ok = match range.kind {
+                0 => {
+                    let start = range.start as usize;
+                    if start.checked_add(pages).is_none_or(|end| end > pool_pages) { return E_INVALIDARG; }
+                    let Some(source) = (start * PAGE).checked_add(pool) else { return E_INVALIDARG };
+                    if !super::title_textures::map_page_alias_range(destination, source, pages) { return E_INVALIDARG; }
+                    mapped += pages;
+                    true
+                }
+                1 => {
+                    let start = range.start as usize;
+                    if start >= pool_pages { return E_INVALIDARG; }
+                    let Some(source) = (start * PAGE).checked_add(pool) else { return E_INVALIDARG; }
+                    if !super::title_textures::map_repeated_page_alias_range(destination, source, pages) { return E_INVALIDARG; }
+                    mapped += pages;
+                    true
+                }
+                2 => {
+                    if !super::title_textures::map_page_alias_range(destination, 0, pages) { return E_INVALIDARG; }
+                    unmapped += pages;
+                    true
+                }
+                3 => { unchanged += pages; true },
+                _ => false,
+            };
+            if !ok {
+                crate::xlog_warn!("D3D12.X: invalid CopyPageMappingsBatchX range kind={} start={} count={} destination={destination:#x}", range.kind, range.start, range.count);
+                return E_INVALIDARG;
+            }
+            destination = next_destination;
+        }
+    }
+    crate::hle::kernelx::note_gpu_view_mapping();
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: CopyPageMappingsBatchX #{n}: batches={count}, mapped={mapped}, unmapped={unmapped}, unchanged={unchanged}, pool={pool:#x}, pool_pages={pool_pages}, flags={flags:#x}");
+    }
+    0
+}
+
 /// first queue slot `queue_dispatch` handles
 const QUEUE_FIRST: usize = 14;
 
 /// A title's call of queue slot `slot` (arguments as integers; Signal / Wait / SignalX /
 /// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
-unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
     const PC_SIGNAL: usize = 14;
     const PC_WAIT: usize = 15;
     const PC_TIMESTAMP_FREQUENCY: usize = 16;
@@ -4896,7 +5090,16 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     if (slot == 16 || slot == 17) && is_fence(a1) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
         crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
     }
-    let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
+    let mut shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
+    // Slot 31's five-argument page-pool update is itself a reliable newer-layout
+    // signal when its pool address/size match a prior RegisterPagePoolX call.
+    if slot == 31 && !shifted
+        && super::device_x::is_registered_page_pool(a3 as u64, a4 as u32)
+    {
+        QUEUE_SHIFTED.store(true, Ordering::Release);
+        shifted = true;
+        crate::xlog_info!("D3D12.X: the title's runtime has the newer queue layout (registered page pool passed to slot 31)");
+    }
     if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
         QUEUE_OLDER.store(true, Ordering::Release);
     }
@@ -4940,6 +5143,8 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             let f: unsafe extern "system" fn(*mut c_void, usize) -> usize = std::mem::transmute(pc(PC_GET_DESC));
             f(this, a1)
         }
+        // Newer queue layout slot 31 (older-layout index 29): CopyPageMappingsBatchX.
+        29 if shifted => copy_page_mappings_batch_x(a1 as u32 as usize, a2, a3, a4 as u32 as usize, a5 as u32 as usize)
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
         // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
@@ -4967,8 +5172,16 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                     }
                 }
             };
-            let _ = a4;
             stubs::record_call(info, 0);
+            if std::env::var_os("XCL_D3D12_TRACE_UNKNOWN").is_some() {
+                let n = info.calls.load(Ordering::Relaxed);
+                if n <= 4 || n.is_power_of_two() {
+                    crate::xlog_info!(
+                        "D3D12 trace: {} this={this:p}, args=({a1:#x}, {a2:#x}, {a3:#x}, {a4:#x}, {a5:#x})",
+                        info.name
+                    );
+                }
+            }
             0
         }
     }
@@ -4977,9 +5190,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
 macro_rules! queue_slots {
     ($($slot:literal),*) => {
         /// the title's entry for each queue slot from `QUEUE_FIRST`
-        static QUEUE_SLOTS: &[unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize) -> usize] = &[$({
-            unsafe extern "system" fn f(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
-                queue_dispatch($slot, this, a1, a2, a3, a4)
+        static QUEUE_SLOTS: &[unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize, usize) -> usize] = &[$({
+            unsafe extern "system" fn f(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> usize {
+                queue_dispatch($slot, this, a1, a2, a3, a4, a5)
             }
             f
         }),*];
