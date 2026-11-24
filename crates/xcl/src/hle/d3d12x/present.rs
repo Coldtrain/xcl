@@ -389,7 +389,8 @@ unsafe fn show_compiling(hwnd: HWND) {
         .sample(now, presented);
     let (_, failed, queued) = super::pso_async::counts();
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
-    let active = running > 0 || queued > 0;
+    let memory_waiters = crate::gpu::recomp::dxc::waiting_for_memory_count();
+    let active = running > 0 || queued > 0 || memory_waiters > 0;
     let recent = {
         let mut last = LAST_ACTIVE.lock().unwrap();
         if active {
@@ -401,7 +402,8 @@ unsafe fn show_compiling(hwnd: HWND) {
     let text = if recent {
         let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}")
+        let waiting = if memory_waiters > 0 { format!(", {memory_waiters} waiting for memory") } else { String::new() };
+        format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}{waiting}")
     } else {
         title
     };
