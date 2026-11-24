@@ -2305,6 +2305,66 @@ unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, st
     hr
 }
 
+/// Retry a host texture creation without optional uses the PC driver refuses. This mirrors
+/// the console's broader format support: UAV is dropped first, then render-target use. The
+/// title's descriptor and GPU memory remain unchanged; only the PC resource is less capable.
+unsafe fn create_committed_with_flag_fallback(
+    this: *mut c_void,
+    props: usize,
+    heap_flags: usize,
+    desc: usize,
+    state: usize,
+    clear: usize,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    let mut hr = dev_create_committed_resource(this, props, heap_flags, desc, state, clear, riid, ppv);
+    if hr >= 0 || desc == 0 || !crate::gpu::shader::readable(desc, 56) {
+        return hr;
+    }
+    let mut retry_desc = [0u8; 56];
+    std::ptr::copy_nonoverlapping(desc as *const u8, retry_desc.as_mut_ptr(), retry_desc.len());
+    let dimension = u32::from_le_bytes(retry_desc[0..4].try_into().unwrap());
+    if dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 {
+        return hr;
+    }
+    let original_flags = u32::from_le_bytes(retry_desc[48..52].try_into().unwrap());
+    let mut resource_flags = original_flags;
+    // Resource flags: render target = 1, depth = 2, unordered access = 4.
+    // Resource states: render target = 0x4, unordered access = 0x8.
+    for (drop_flag, drop_state, name) in [
+        (4u32, 0x8usize, "unordered access"),
+        (1u32, 0x4usize, "render-target"),
+    ] {
+        if resource_flags & drop_flag == 0 {
+            continue;
+        }
+        resource_flags &= !drop_flag;
+        retry_desc[48..52].copy_from_slice(&resource_flags.to_le_bytes());
+        let retry_state = state & !drop_state;
+        let retry_clear = if resource_flags & (1 | 2) == 0 { 0 } else { clear };
+        let retry = dev_create_committed_resource(
+            this,
+            props,
+            heap_flags,
+            retry_desc.as_ptr() as usize,
+            retry_state,
+            retry_clear,
+            riid,
+            ppv,
+        );
+        if retry >= 0 {
+            crate::xlog_warn!(
+                "D3D12.X: host texture created without unsupported {name} use (format {}, original flags {original_flags:#x}, host flags {resource_flags:#x})",
+                u32::from_le_bytes(retry_desc[32..36].try_into().unwrap())
+            );
+            return retry;
+        }
+        hr = retry;
+    }
+    hr
+}
+
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if desc != 0 && std::env::var_os("XCL_D3D12_TRACE").is_some() && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -2351,7 +2411,7 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
     // console-only state bits (e.g. 0x100000 on a display target) are not the PC's
-    let hr = dev_create_committed_resource(this, props, flags, desc, state & PC_RESOURCE_STATES as usize, clear, riid, ppv);
+    let hr = create_committed_with_flag_fallback(this, props, flags, desc, state & PC_RESOURCE_STATES as usize, clear, riid, ppv);
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
         crate::xlog_warn!(
@@ -2726,7 +2786,7 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     // heap's kind; the console's aliasing of that one placement is lost.
     let is_texture = u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     let hr3 = match heap_desc {
-        Some(h) if hr2 < 0 && is_texture => Some(dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv)),
+        Some(h) if hr2 < 0 && is_texture => Some(create_committed_with_flag_fallback(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv)),
         _ => None,
     };
     static N: AtomicU64 = AtomicU64::new(0);
