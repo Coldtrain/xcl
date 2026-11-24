@@ -4024,15 +4024,12 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
-        if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
-            // a console program the worker is translating (its root signature comes with it);
-            // the real PSO registers itself in TRANSLATED_COMPUTE once build_compute succeeds
-            // (if build_compute fails, the stand-in stays unregistered so Dispatch /
-            // ExecuteIndirect never bind XCL's ABI root signature onto it)
-            LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
-            LAST_COMPUTE_RS.with(|c| c.set(0));
-            return hr;
-        }
+        // Never give the title a dummy compute PSO. A dummy dispatch silently omits GPU writes
+        // that later Wait32/Wait64 operations may depend on, leaving the game permanently stuck.
+        // Unlike graphics, compute is part of the game's execution and synchronization state:
+        // compile it here on the creating thread after the cache-only probe reports a miss.
+        // This deliberately trades loading time for correctness; no dispatch can run with a
+        // stand-in while the real shader is still compiling or after its build has failed.
         console = translated_compute_pso(this, f, desc, riid, ppv);
     }
     LAST_COMPUTE_TRANSLATED.with(|c| c.set(matches!(console, Some(Ok(hr)) if hr >= 0)));
