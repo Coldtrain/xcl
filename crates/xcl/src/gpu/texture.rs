@@ -216,6 +216,39 @@ pub fn bc7pack_subresources(
     Ok((out, stats))
 }
 
+/// Record the decoded BC7 subresources into an existing D3D12 resource.
+/// The caller owns command-list submission and resource-state tracking.
+pub unsafe fn record_upload_bc7pack(
+    dev: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    res: &ID3D12Resource,
+    t: &Image,
+    chunks: &[&[u8]],
+    cfg: PipeConfig,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> Result<Bc7PackStats, String> {
+    let (subs, stats) = bc7pack_subresources(t, chunks, cfg)?;
+    record_upload(dev, list, res, &subs, before, after)?;
+    Ok(stats)
+}
+
+/// Upload explicit BCPack chunks into an existing D3D12 resource and wait for completion.
+pub unsafe fn upload_bc7pack(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    res: &ID3D12Resource,
+    t: &Image,
+    chunks: &[&[u8]],
+    cfg: PipeConfig,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> Result<Bc7PackStats, String> {
+    let (subs, stats) = bc7pack_subresources(t, chunks, cfg)?;
+    upload(dev, queue, res, &subs, before, after)?;
+    Ok(stats)
+}
+
 /// Create a D3D12 BC7 resource from explicit BCPack chunks. Chunks must be
 /// ordered array-slice major, then mip level. Use create for ordinary BC7.
 pub unsafe fn create_bc7pack(
@@ -225,7 +258,6 @@ pub unsafe fn create_bc7pack(
     chunks: &[&[u8]],
     cfg: PipeConfig,
 ) -> Result<(ID3D12Resource, Bc7PackStats), String> {
-    let (subs, stats) = bc7pack_subresources(t, chunks, cfg)?;
     let (rd, _) = desc::image_d3d12(t).ok_or_else(|| format!("format {} without a DXGI equivalent", t.format))?;
     let mut r: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(
@@ -237,7 +269,7 @@ pub unsafe fn create_bc7pack(
         &mut r,
     ).map_err(|x| format!("CreateCommittedResource: {x}"))?;
     let r = r.ok_or("CreateCommittedResource without a resource")?;
-    upload(dev, queue, &r, &subs, D3D12_RESOURCE_STATE_COPY_DEST, SHADER_READ)?;
+    let stats = upload_bc7pack(dev, queue, &r, t, chunks, cfg, D3D12_RESOURCE_STATE_COPY_DEST, SHADER_READ)?;
     Ok((r, stats))
 }
 
