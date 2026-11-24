@@ -358,8 +358,8 @@ mod tests {
     fn normalization_preserves_pixels_for_every_mode_rotation_and_index_selection() {
         for mode in 0..8u8 {
             let m = &MODES[mode as usize];
-            for rotation in 0..=m.rb as u8 {
-                for isel in 0..=m.isb as u8 {
+            for rotation in 0..(1u8 << m.rb) {
+                for isel in 0..(1u8 << m.isb) {
                     let mut f = Fields {
                         mode,
                         rotation,
