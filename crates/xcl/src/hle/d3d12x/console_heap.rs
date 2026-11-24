@@ -284,6 +284,9 @@ pub fn unregister(obj: usize) {
         if let Some(kept) = KEPT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             kept.retain(|&at, _| at < h.shadow || at >= end);
         }
+        if let Some(resources) = RES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            resources.retain(|&at, _| at < h.shadow || at >= end);
+        }
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             release_global(f, page_descriptors(h.n, p as u32));
         }
