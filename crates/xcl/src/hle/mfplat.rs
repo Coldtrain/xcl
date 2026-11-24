@@ -23,7 +23,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Device;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4};
 use windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager;
 
-use crate::util::{E_POINTER, HRESULT};
+use crate::util::{E_POINTER, HRESULT, S_OK};
 
 const D3D_DRIVER_TYPE_UNKNOWN: i32 = 0;
 const D3D_DRIVER_TYPE_HARDWARE: i32 = 1;
@@ -381,7 +381,6 @@ use std::sync::{Mutex, OnceLock};
 
 
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
-const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 /// What Media Foundation answers for a URL scheme it has no handler for.
 const UNSUPPORTED_SCHEME: HRESULT = 0xC00D_36C3_u32 as i32;
 
