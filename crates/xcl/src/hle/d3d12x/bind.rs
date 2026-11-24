@@ -714,6 +714,19 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    if super::real::two_pass_of(pso).is_some() {
+        match translated_two_pass_mesh(this, list, pso, x, y, z) {
+            Ok(()) => count(DISPATCHES),
+            Err(e) => {
+                count(DISPATCHES_SKIPPED);
+                static M: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if M.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    crate::xlog_warn!("D3D12.X: two-pass mesh dispatch skipped: {e}");
+                }
+            }
+        }
+        return;
+    }
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
         // failed): nothing to run (its root arguments were not given to the PC list either)
@@ -839,6 +852,47 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
         }
         None => std::ptr::null_mut(),
     }
+}
+
+/// Execute Victory's two-pass mesh strategy: the console mesh program runs as compute,
+/// writes one record per dispatch group, then the pass-through native mesh shader consumes
+/// those exact records. The result UAV must be the same allocation in both stages.
+unsafe fn translated_two_pass_mesh(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    pso: usize,
+    x: u32,
+    y: u32,
+    z: u32,
+) -> Result<(), String> {
+    let tp = super::real::two_pass_of(pso).ok_or("two-pass pipeline disappeared")?;
+    let groups = x.checked_mul(y).and_then(|n| n.checked_mul(z)).ok_or("mesh group count overflow")?;
+    if groups == 0 {
+        return Ok(());
+    }
+    let bytes = tp.record.record_dwords()
+        .checked_mul(groups as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or("mesh record buffer size overflow")?
+        .max(256);
+    // Avoid exhausting the title's unified-memory arena on a malformed or unexpectedly
+    // enormous dispatch. The limit is intentionally generous for the game's scene batches.
+    if bytes > 512 * 1024 * 1024 {
+        return Err(format!("mesh records require {bytes} bytes (512 MiB limit)"));
+    }
+    let res_at = bind_abi_with_res(this, list, tp.compute, false, None, bytes)?;
+    list.Dispatch(x, y, z);
+    // All console compute writes must be visible before the native mesh shader reads u1.
+    super::list_x::uav_barrier_x(this, 0, std::ptr::null());
+    bind_abi_with_res(this, list, pso, true, Some(res_at), bytes)?;
+    let mesh_groups = groups.checked_mul(tp.mesh_groups_per_record.max(1)).ok_or("mesh dispatch count overflow")?;
+    if mesh_groups > 65_535 {
+        return Err(format!("native mesh dispatch requires {mesh_groups} groups (65,535 limit)"));
+    }
+    let mesh = list.cast::<ID3D12GraphicsCommandList6>().map_err(|e| format!("ID3D12GraphicsCommandList6 unavailable: {e}"))?;
+    mesh.DispatchMesh(mesh_groups, 1, 1);
+    count(DRAWS);
+    Ok(())
 }
 
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
