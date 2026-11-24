@@ -4,7 +4,7 @@
 Patch GTA VI intentional null writes and identified debug breakpoints.
 
 Usage:
-    python patch_null_write.py F:\\Games\\GTAVI\\game_scarlett_master.exe
+    python patch_null_write.py game_scarlett_master.exe
 
 Creates:
     game_scarlett_master.exe.pre_nullwrite_patch.bak
