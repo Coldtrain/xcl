@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use super::{dxc, interface, translate, Mode, Options};
 use crate::gpu::xbox;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stage {
     Vertex,
     Pixel,
@@ -351,7 +351,7 @@ pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static st
     console_translation(blob, stage, 0, mem_windows(), false).map(|(t, p)| (t.hlsl, p))
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ShaderKey {
     hash: u64,
     stage: Stage,
