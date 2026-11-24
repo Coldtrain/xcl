@@ -109,21 +109,55 @@ unsafe fn describe_ptr(p: u64) -> String {
 
 /// `frame`: the thunk's stack at the call – the saved r9, r8, rdx, rcx at +0x68.., the return
 /// address at +0x88 and the caller's stack arguments from +0x90 + 0x20 (the shadow space).
+unsafe fn log_trace(caller: usize, name: &str, frame: *const u64) {
+    let at = |off: usize| *frame.add(off / 8);
+    let this = at(0x80);
+    let (a1, a2, a3) = (at(0x78), at(0x70), at(0x68));
+    // The first three explicit arguments are in RDX/R8/R9; subsequent
+    // arguments are on the caller's stack after the 32-byte shadow space.
+    let (a4, a5, a6, a7, a8) = (
+        at(0x90 + 0x20),
+        at(0x90 + 0x28),
+        at(0x90 + 0x30),
+        at(0x90 + 0x38),
+        at(0x90 + 0x40),
+    );
+    crate::xlog_info!(
+        "D3D12 trace: {} ← {}: this={this:#x}, args=({a1:#x}{}, {a2:#x}{}, {a3:#x}{}, {a4:#x}, {a5:#x}, {a6:#x}, {a7:#x}, {a8:#x})",
+        name,
+        crate::modules::describe_address(caller),
+        describe_ptr(a1),
+        describe_ptr(a2),
+        describe_ptr(a3)
+    );
+}
+
 unsafe extern "system" fn trace(caller: usize, name: *const String, frame: *const u64) -> usize {
     if crate::modules::image_base_for_addr(caller).is_some() {
-        let at = |off: usize| *frame.add(off / 8);
-        let (a1, a2, a3) = (at(0x78), at(0x70), at(0x68));
-        let (a4, a5) = (at(0x90 + 0x20), at(0x90 + 0x28));
-        crate::xlog_info!(
-            "D3D12 trace: {} ← {}: ({a1:#x}{}, {a2:#x}{}, {a3:#x}{}, {a4:#x}, {a5:#x})",
-            *name,
-            crate::modules::describe_address(caller),
-            describe_ptr(a1),
-            describe_ptr(a2),
-            describe_ptr(a3)
-        );
+        log_trace(caller, &*name, frame);
     }
     0
+}
+
+/// Like make_guard, but when XCL_D3D12_TRACE_UNKNOWN is enabled it records the
+/// first five arguments of title calls before returning the same neutral result.
+unsafe extern "system" fn classify_trace(caller: usize, info: *const StubInfo, frame: *const u64) -> usize {
+    if crate::modules::image_base_for_addr(caller).is_some() {
+        let info = &*info;
+        stubs::record_call(info, caller);
+        let n = info.calls.load(std::sync::atomic::Ordering::Relaxed);
+        if n <= 4 || n.is_power_of_two() {
+            log_trace(caller, &info.name, frame);
+        }
+        1
+    } else {
+        0
+    }
+}
+
+/// A guarded internal/console slot with argument capture; PC runtime calls still reach original.
+pub fn make_guard_trace(original: usize, info: &'static StubInfo) -> usize {
+    thunk(Tail::GuardOr(original), info as *const StubInfo as u64, classify_trace as usize)
 }
 
 /// Like a guard, but always forwards: calls from a game image are logged (`XCL_D3D12_TRACE`).
