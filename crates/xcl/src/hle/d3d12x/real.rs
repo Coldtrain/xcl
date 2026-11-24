@@ -4016,22 +4016,23 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     if let Some(Ok(hr)) = console {
         return hr;
     }
-    // a console shader the recompiler could not take must not reach the driver: AMD's shader
-    // compiler crashes on the stripped DXIL (NOBC bitcode) instead of rejecting it
-    let hr = if console.is_some() { E_INVALIDARG } else { finish_pso(this, f, desc, riid, ppv) };
+    // A translated console compute shader must never be replaced by a dummy CS. The title
+    // treats a successfully-created PSO as executable work; a dummy dispatch silently omits
+    // writes that later GPU waits depend on. Surface translation/driver failures instead.
+    if console.is_some() {
+        return E_INVALIDARG;
+    }
+    let hr = finish_pso(this, f, desc, riid, ppv);
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return hr;
     }
+    // Retain the legacy fallback only for non-console PC compute shaders.
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
     copy.CS = bytecode(&dummy().cs);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     note_fallback("compute PSO", hr, hr2 >= 0);
-    if hr2 >= 0 {
-        hr2
-    } else {
-        hr
-    }
+    if hr2 >= 0 { hr2 } else { hr }
 }
 
 // ---------------------------------------------------------------------------------------
