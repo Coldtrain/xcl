@@ -214,11 +214,16 @@ pub fn decode_with(chunk: &[u8], blocks: usize, t: &Tables) -> Option<Bc7Output>
 
 /// As [`decode_with`], also returning each block's endpoint and index state.
 pub fn decode_states(chunk: &[u8], blocks: usize, t: &Tables) -> Option<(Bc7Output, Vec<EpState>, Vec<IdxState>)> {
+    let symbols = blocks.checked_mul(2)?;
+    let output_bytes = blocks.checked_mul(16)?;
+    if blocks == 0 {
+        return None;
+    }
     let mut source = crate::bcpack_rans::rans::SliceSource { data: chunk, pos: 0 };
     let lanes = crate::bcpack_rans::rans::decode_lanes(
         &mut source,
         &BC7_ALPHABET_BITS,
-        2 * blocks,
+        symbols,
         chunk.len(),
     ).ok()?;
     let lane: Vec<&[u16]> = (0..16).map(|k| lanes.lane(k)).collect();
@@ -227,7 +232,7 @@ pub fn decode_states(chunk: &[u8], blocks: usize, t: &Tables) -> Option<(Bc7Outp
     let mut ix: Vec<IdxState> = vec![[[0; 16]; 2]; blocks];
     let mut tainted_ep = vec![false; blocks];
     let mut tainted_ix = vec![false; blocks];
-    let mut out = vec![0u8; blocks * 16];
+    let mut out = vec![0u8; output_bytes];
     let (mut unfitted, mut invalid) = (0, 0);
     let mut invalid_by_mode = [0usize; 8];
     let mut normalized_count = 0usize;
@@ -345,7 +350,9 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_short_streams_fail_cleanly() {
+    fn arbitrary_short_streams_and_overflowing_block_counts_fail_cleanly() {
         assert!(decode(&[], 1).is_none());
+        assert!(decode(&[], 0).is_none());
+        assert!(decode(&[], usize::MAX).is_none());
     }
 }

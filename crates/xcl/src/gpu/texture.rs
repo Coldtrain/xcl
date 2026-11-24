@@ -135,10 +135,6 @@ fn bc7_stream_to_linear(
     if blocks.len() != bytes {
         return Err(format!("BC7 decoder returned {} bytes for {count} blocks (expected {bytes})", blocks.len()));
     }
-    if slice >= chain.layers().max(1) && chain.layout.block_d > 1 {
-        return Err(format!("BC7 slice {slice} is outside the tiled depth layers"));
-    }
-
     let mut order = Vec::with_capacity(count);
     for y in 0..l.height {
         for x in 0..l.width {
@@ -1196,26 +1192,27 @@ mod tests {
     fn bc7_stream_order_is_reordered_to_row_major_for_tiled_mips() {
         let layout = super::super::tiling::Layout::new(5, 4, CONSOLE_PIPES).unwrap();
         let chain = Chain::new(layout, 256, 128, 4, 5);
-        let level = 0;
-        let l = chain.levels[level];
-        let count = l.width * l.height;
-        let mut blocks = vec![0u8; count * 16];
-        for i in 0..count {
-            blocks[i * 16..(i + 1) * 16].fill((i & 0xff) as u8);
-        }
-        let linear = bc7_stream_to_linear(&chain, level, 0, &blocks).unwrap();
         let layout = &chain.layout;
-        let origin = l.origin;
-        let pitch = l.pitch;
-        let level_offset = l.offset;
-        let mut expected_order: Vec<(usize, usize)> = (0..l.height)
-            .flat_map(|y| (0..l.width).map(move |x| {
-                (level_offset + layout.offset_z(x + origin.0, y + origin.1, 0, pitch), y * l.width + x)
-            }))
-            .collect();
-        expected_order.sort_unstable_by_key(|x| x.0);
-        for (stream, &(_, raster)) in expected_order.iter().enumerate() {
-            assert_eq!(linear[raster * 16], (stream & 0xff) as u8);
+        for level in 0..chain.levels.len() {
+            let l = chain.levels[level];
+            let count = l.width * l.height;
+            let mut blocks = vec![0u8; count * 16];
+            for i in 0..count {
+                blocks[i * 16..(i + 1) * 16].fill((i & 0xff) as u8);
+            }
+            let linear = bc7_stream_to_linear(&chain, level, 0, &blocks).unwrap();
+            let origin = l.origin;
+            let pitch = l.pitch;
+            let level_offset = l.offset;
+            let mut expected_order: Vec<(usize, usize)> = (0..l.height)
+                .flat_map(|y| (0..l.width).map(move |x| {
+                    (level_offset + layout.offset_z(x + origin.0, y + origin.1, 0, pitch), y * l.width + x)
+                }))
+                .collect();
+            expected_order.sort_unstable_by_key(|x| x.0);
+            for (stream, &(_, raster)) in expected_order.iter().enumerate() {
+                assert_eq!(linear[raster * 16], (stream & 0xff) as u8, "mip {level}");
+            }
         }
     }
 
