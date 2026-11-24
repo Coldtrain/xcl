@@ -1,11 +1,11 @@
-//! Non-blocking graphics pipeline creation. Translating a console shader takes milliseconds;
-//! compiling the HLSL with DXC takes 0.2 s to seconds, and a title creates thousands of graphics
-//! pipelines while it loads. When a graphics pipeline's DXIL is not in the disk cache yet, the
-//! title gets a stand-in pipeline (shaders that draw nothing) at once and the real one is built
-//! on a worker. Compute pipelines are deliberately excluded: a dummy dispatch can omit GPU writes
-//! required by later synchronization (including Wait64), so compute PSOs are built synchronously
-//! on a cache miss before the title receives them.
-//! `XCL_ASYNC_PSO=0` builds graphics pipelines in the call, as before.
+//! Non-blocking pipeline creation. Translating a console shader takes milliseconds; compiling
+//! the HLSL with DXC takes 0.2 s to seconds, and a title creates thousands of pipelines while it
+//! loads. When a pipeline's DXIL is not in the disk cache yet, the title gets a stand-in
+//! pipeline (shaders that draw nothing) at once and the real one is built on a worker; binding
+//! (`SetPipelineState`, console list replay, the two-pass lookups) uses the real one as soon
+//! as it is there. A graphics pipeline draws nothing until then; a compute pipeline is waited
+//! for at its first bind (a skipped dispatch would corrupt what it computes).
+//! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
