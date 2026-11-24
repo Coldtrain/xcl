@@ -24,9 +24,10 @@
 //!   then 5 more.
 //!
 //! Each queue has a worker thread: submitted requests run in order (file reads through the
-//! VFS like the title's own, memory copies, zlib), a status entry gets the first failure of
-//! the requests since the previous one, a signal sets the fence from the CPU. Methods not
-//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused.
+//! VFS like the title's own, memory copies, zlib and supported BCPack modes), a status entry
+//! gets the first failure of the requests since the previous one, a signal sets the fence from
+//! the CPU. Methods not listed are logged and answer E_NOTIMPL; unsupported BCPack/swizzle
+//! modes are refused.
 
 #![allow(non_snake_case)]
 
@@ -131,7 +132,7 @@ fn bcpack_name(mode: u8) -> String {
     BCPACK_NAMES.get(mode as usize).map_or_else(|| format!("mode {mode}"), |n| n.to_string())
 }
 
-/// BCPack requests refused at enqueue (XCL has no BCPack decoder), by mode.
+/// BCPack requests refused at enqueue (currently unsupported modes; BC1, BC5 and BC6H decode), by mode.
 struct BcpackRefusals {
     requests: [AtomicU64; 16],
     with_zlib: [AtomicU64; 16],
@@ -653,7 +654,18 @@ impl Request {
             warn_once("DSTORAGE_REQUEST_OPTIONS", format_args!("unknown high option bits {:#x}", self.options & !KNOWN_OPTIONS_MASK));
         }
         if self.swizzle() != 0 {
-            warn_once("SwizzleMode", format_args!("hardware swizzle mode {} unsupported", self.swizzle()));
+            warn_once("SwizzleMode", format_args!(
+                "hardware swizzle mode {} unsupported (BCPack={}, zlib={}, source={}, source_phys={}, dest_phys={}, src={}, intermediate={}, dst={})",
+                self.swizzle(),
+                self.bcpack(),
+                self.zlib(),
+                if self.memory_source() { "memory" } else { "file" },
+                self.source_physical_pages(),
+                self.dest_physical_pages(),
+                self.source_size,
+                self.intermediate_size,
+                self.destination_size
+            ));
             return Err(E_DECOMPRESSION);
         }
         match (self.zlib(), self.bcpack()) {
@@ -674,21 +686,37 @@ impl Request {
                     return Err(E_DESTINATION_SIZE);
                 }
             }
-            // Two-stage zlib -> BCPack: validate intermediate bounds when supplied, then refuse BCPack
-            // (counted and logged at enqueue, `BcpackRefusals`).
-            (true, _) => {
-                if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
+            // BC1 BCPack: output is a sequence of 8-byte BC1 blocks.
+            (true, 1) => {
+                if self.destination_size == 0 || self.destination_size % 8 != 0
+                    || (self.intermediate_size != 0
+                        && (self.intermediate_size <= self.source_size || self.intermediate_size >= self.destination_size))
+                {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
             }
-            // Single-stage BCPack: `intermediate_size` must be 0, then refuse BCPack.
-            (false, _) => {
-                if self.intermediate_size != 0 {
+            (false, 1) => {
+                if self.destination_size == 0 || self.destination_size % 8 != 0 || self.intermediate_size != 0 {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
             }
+            // BC5 and BC6H BCPack both restore 16-byte blocks. zlib, when present,
+            // is applied first; intermediate_size is the inflated BCPack stream size.
+            (true, 5 | 6) => {
+                if self.destination_size == 0 || self.destination_size % 16 != 0
+                    || (self.intermediate_size != 0
+                        && (self.intermediate_size <= self.source_size || self.intermediate_size >= self.destination_size))
+                {
+                    return Err(E_DESTINATION_SIZE);
+                }
+            }
+            (false, 5 | 6) => {
+                if self.destination_size == 0 || self.destination_size % 16 != 0 || self.intermediate_size != 0 {
+                    return Err(E_DESTINATION_SIZE);
+                }
+            }
+            // Other BCPack modes remain unsupported.
+            (true, _) | (false, _) => return Err(E_DECOMPRESSION),
         }
         Ok(())
     }
@@ -813,11 +841,130 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    if r.swizzle() != 0 || r.bcpack() != 0 {
+    if r.swizzle() != 0 {
+        warn_once("DirectStorage swizzle", format_args!(
+            "mode {} is not decoded by the host path (BCPack={}, zlib={}, src={}, intermediate={}, dst={})",
+            r.swizzle(), r.bcpack(), r.zlib(), r.source_size, r.intermediate_size, n
+        ));
+        return Err(E_DECOMPRESSION);
+    }
+    if r.bcpack() != 0 && r.bcpack() != 1 && r.bcpack() != 5 && r.bcpack() != 6 {
+        warn_once("DirectStorage BCPack", format_args!(
+            "mode {} is not decoded by the host path (swizzle={}, zlib={}, src={}, intermediate={}, dst={})",
+            r.bcpack(), r.swizzle(), r.zlib(), r.source_size, r.intermediate_size, n
+        ));
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.zlib() {
+    let payload: Vec<u8> = if r.bcpack() == 1 {
+        // Transform order: zlib (if present), then BCPack. BC1 BCPack restores
+        // ordinary 8-byte BC1 blocks in stream/Gfx10 order.
+        let packed = if r.zlib() {
+            let limit = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
+            let d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, limit)
+                .map_err(|_| E_ZLIB_DATA)?;
+            if r.intermediate_size != 0 && d.len() != limit {
+                return Err(E_ZLIB_DATA);
+            }
+            d
+        } else {
+            src
+        };
+        let Some(decoded) = crate::bc1pack::decode_bc1(&packed, n / 8) else {
+            warn_once("BCPack BC1 decode failure", format_args!(
+                "entropy/block decode rejected stream: packed={}, blocks={}, dst={}, src={}, intermediate={}, zlib={}",
+                packed.len(), n / 8, n, r.source_size, r.intermediate_size, r.zlib()
+            ));
+            return Err(E_DECOMPRESSION);
+        };
+        if decoded.blocks.len() != n {
+            warn_once("BCPack BC1 output size", format_args!(
+                "decoded {} bytes, expected {} (packed={}, src={}, intermediate={})",
+                decoded.blocks.len(), n, packed.len(), r.source_size, r.intermediate_size
+            ));
+            return Err(E_DECOMPRESSION);
+        }
+        if decoded.unfitted_blocks != 0 || decoded.prestart_refs != 0 {
+            warn_once("BCPack BC1 preset history", format_args!(
+                "{} blocks referenced unfitted preset-history slots; {} references point before the chunk start",
+                decoded.unfitted_blocks, decoded.prestart_refs
+            ));
+        }
+        decoded.blocks
+    } else if r.bcpack() == 5 {
+        // Transform order: zlib (if present), then BCPack. BC5 BCPack restores
+        // ordinary 16-byte BC5 blocks (two BC4 channels).
+        let packed = if r.zlib() {
+            let limit = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
+            let d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, limit)
+                .map_err(|_| E_ZLIB_DATA)?;
+            if r.intermediate_size != 0 && d.len() != limit {
+                return Err(E_ZLIB_DATA);
+            }
+            d
+        } else {
+            src
+        };
+        let Some(decoded) = crate::bc5pack::decode_bc5(&packed, n / 16) else {
+            warn_once("BCPack BC5 decode failure", format_args!(
+                "entropy/block decode rejected stream or too many unknown history roots: packed={}, blocks={}, dst={}, src={}, intermediate={}, zlib={}",
+                packed.len(), n / 16, n, r.source_size, r.intermediate_size, r.zlib()
+            ));
+            return Err(E_DECOMPRESSION);
+        };
+        if decoded.blocks.len() != n {
+            warn_once("BCPack BC5 output size", format_args!(
+                "decoded {} bytes, expected {} (packed={}, src={}, intermediate={})",
+                decoded.blocks.len(), n, packed.len(), r.source_size, r.intermediate_size
+            ));
+            return Err(E_DECOMPRESSION);
+        }
+        if !decoded.provisional_entries.is_empty() || decoded.unknown_blocks != 0 {
+            warn_once("BCPack BC5 preset history", format_args!(
+                "{} provisional history slots and {} unknown-history blocks across entries {:?}",
+                decoded.provisional_entries.len(), decoded.unknown_blocks, decoded.unknown_entries
+            ));
+        }
+        decoded.blocks
+    } else if r.bcpack() == 6 {
+        // Transform order: zlib (if present), then BCPack. BCPack restores
+        // the original 16-byte BC6H blocks; the GPU performs texture sampling.
+        let packed = if r.zlib() {
+            let limit = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
+            let d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, limit)
+                .map_err(|_| E_ZLIB_DATA)?;
+            if r.intermediate_size != 0 && d.len() != limit {
+                return Err(E_ZLIB_DATA);
+            }
+            d
+        } else {
+            src
+        };
+        let Some(decoded) = crate::bc6pack::decode_bc6h(&packed, n / 16) else {
+            warn_once("BCPack BC6H decode failure", format_args!(
+                "entropy/block decode rejected stream: packed={}, blocks={}, dst={}, src={}, intermediate={}, zlib={}",
+                packed.len(), n / 16, n, r.source_size, r.intermediate_size, r.zlib()
+            ));
+            return Err(E_DECOMPRESSION);
+        };
+        if decoded.blocks.len() != n {
+            warn_once("BCPack BC6H output size", format_args!(
+                "decoded {} bytes, expected {} (packed={}, src={}, intermediate={})",
+                decoded.blocks.len(), n, packed.len(), r.source_size, r.intermediate_size
+            ));
+            return Err(E_DECOMPRESSION);
+        }
+        if decoded.unfitted_blocks != 0 {
+            warn_once(
+                "BCPack BC6H preset history",
+                format_args!(
+                    "{} BC6H blocks referenced unfitted preset-history slots; half-range predictors were substituted",
+                    decoded.unfitted_blocks
+                ),
+            );
+        }
+        decoded.blocks
+    } else if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
         let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
         if d.len() != stage1_len {
@@ -939,11 +1086,34 @@ struct QueueInner {
 
 impl QueueInner {
     fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
-        FAILED.fetch_add(1, Ordering::Relaxed);
+        let failed = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+        let file_path = file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default();
+        if failed <= 16 || failed.is_power_of_two() {
+            crate::xlog_warn!(
+                "DirectStorage: request failure #{failed} ({hr:#x}): options={:#x}, BCPack={} ({}), swizzle={}, zlib={}, source={}, source_phys={}, dest_phys={}, src={:#x}, file_offset={:#x}, src_size={}, intermediate={}, dst={:#x}, dst_size={}, dst_page_offset={}, src_page_offset={}, tag={:#x}, file={}",
+                request.options,
+                request.bcpack(),
+                bcpack_name(request.bcpack()),
+                request.swizzle(),
+                request.zlib(),
+                if request.memory_source() { "memory" } else { "file" },
+                request.source_physical_pages(),
+                request.dest_physical_pages(),
+                request.source,
+                request.offset,
+                request.source_size,
+                request.intermediate_size,
+                request.destination,
+                request.destination_size,
+                request.destination_page_offset,
+                request.source_page_offset,
+                request.tag,
+                file_path
+            );
+        }
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
-            crate::xlog_warn!("DirectStorage: a request failed ({hr:#x}): {} bytes from {}", request.destination_size, file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default());
             e.1 = Some(FirstError { hr, request, file: file.map(|f| f.path.clone()).unwrap_or_default() });
         }
         unsafe { SetEvent(self.error_event as HANDLE) };
@@ -1432,7 +1602,8 @@ mod tests {
         let mem = Request::parse(&request(SOURCE_MEMORY_BIT | 1, 0x1000, 64, 0x2000, 0x99, 20));
         assert_eq!((mem.offset, mem.check(true)), (0, Ok(())), "a memory source has no offset");
         assert_eq!(Request::parse(&request(1, 0x1000, 20, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request(3, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack");
+        assert_eq!(Request::parse(&request(3, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BC1 remains unsupported");
+        assert_eq!(Request::parse(&request(6 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 32)).check(false), Ok(()), "BC6H BCPack");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
     }
 
@@ -1649,6 +1820,7 @@ mod tests {
         // Validation matrix for Request::check
         let bc1 = 1u64 << BCPACK_SHIFT;
         let bc7 = 7u64 << BCPACK_SHIFT;
+        let bc6h = 6u64 << BCPACK_SHIFT;
         let swiz = 1u64 << SWIZZLE_SHIFT;
 
         // Zlib only with valid intermediate_size (== dst and < dst)
@@ -1661,7 +1833,13 @@ mod tests {
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION
+        // BC6H BCPack accepts 16-byte-aligned output sizes with no intermediate,
+        // or a strictly smaller zlib intermediate.
+        assert_eq!(Request::parse(&request_ex(bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Ok(()));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
+        assert_eq!(Request::parse(&request_ex(bc6h, 0x1000, 0, 255, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DESTINATION_SIZE));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc6h, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
+        // Single-stage unsupported BCPack: intermediate must be 0, then E_DECOMPRESSION
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
         // Hardware swizzle mode unsupported
@@ -2228,10 +2406,12 @@ mod tests {
         assert_eq!((s["BC7"].requests, s["BC7"].with_zlib, s["BC7"].destination_bytes), (3, 1, 0x30000));
         assert_eq!((s["BC1"].requests, s["BC1"].with_zlib, s["BC1"].destination_bytes), (1, 0, 0x8000));
         assert_eq!(counts.summary(), "BC1 1 (32768 bytes), BC7 3 (196608 bytes)");
-        for m in 1..=7u64 {
+        for m in [1u64, 2, 3, 4, 5, 7] {
             let r = Request::parse(&request(SOURCE_MEMORY_BIT | m << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20));
             assert_eq!(r.check(true), Err(E_DECOMPRESSION));
         }
+        let bc6h = Request::parse(&request(SOURCE_MEMORY_BIT | 6 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 32));
+        assert_eq!(bc6h.check(true), Ok(()));
     }
 
     #[test]
