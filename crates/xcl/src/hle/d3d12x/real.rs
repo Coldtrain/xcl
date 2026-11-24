@@ -3812,14 +3812,6 @@ unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
     }
 }
 
-unsafe fn own_compute(desc: *const c_void) -> Option<OwnedDesc> {
-    let mut d: Box<D3D12_COMPUTE_PIPELINE_STATE_DESC> = Box::new(std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC));
-    let mut blobs = Vec::new();
-    own_shader(&mut d.CS, &mut blobs);
-    d.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    Some(OwnedDesc::Compute(d, blobs))
-}
-
 /// None with stream output (not copied; such pipelines are built in the call).
 unsafe fn own_graphics(desc: *const c_void) -> Option<OwnedDesc> {
     let mut d: Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC> = Box::new(std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC));
@@ -3899,13 +3891,6 @@ unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, rii
     finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
 }
 
-unsafe fn standin_compute(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
-    copy.CS = bytecode(&dummy().cs);
-    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
-}
-
 unsafe fn standin_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let Some((buf, _)) = fallback_stream(desc as *const u8) else { return E_INVALIDARG };
     let new_desc: [usize; 2] = [buf.len(), buf.as_ptr() as usize];
@@ -3957,11 +3942,6 @@ unsafe fn go_background(
 unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
     matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(hr) if hr >= 0)
-}
-
-unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
-    let iid = pc_iid(Kind::PipelineState);
-    matches!(translated_compute_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
 }
 
 unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
