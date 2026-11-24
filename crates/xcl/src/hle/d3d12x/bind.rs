@@ -880,6 +880,15 @@ unsafe fn translated_two_pass_mesh(
     if bytes > 512 * 1024 * 1024 {
         return Err(format!("mesh records require {bytes} bytes (512 MiB limit)"));
     }
+    static MESH_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let run = MESH_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if run < 8 || run.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: two-pass mesh #{run}: groups={x}x{y}x{z}, record={} dwords, u1={bytes} bytes, mesh groups/record={}",
+            tp.record.record_dwords(),
+            tp.mesh_groups_per_record
+        );
+    }
     let res_at = bind_abi_with_res(this, list, tp.compute, false, None, bytes)?;
     list.Dispatch(x, y, z);
     // All console compute writes must be visible before the native mesh shader reads u1.
