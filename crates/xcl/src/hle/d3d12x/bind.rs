@@ -854,6 +854,20 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    bind_abi_with_res(this, list, pso, gfx, None, 256).map(|_| ())
+}
+
+/// Bind one pass of a two-pass mesh pipeline. The result allocation is deliberately shared
+/// between the compute writer and native mesh reader; allocating a fresh u1 for each pass
+/// silently disconnects the records produced by the first dispatch.
+unsafe fn bind_abi_with_res(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    pso: usize,
+    gfx: bool,
+    shared_res: Option<usize>,
+    res_bytes: usize,
+) -> Result<usize, String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
@@ -877,7 +891,13 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
-    let res_at = copy(&[0u8; 256])?;
+    let res_at = match shared_res {
+        Some(at) => at,
+        None => {
+            let zeroes = vec![0u8; res_bytes.max(256)];
+            copy(&zeroes)?
+        }
+    };
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
@@ -897,7 +917,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
     list.SetPipelineState(pc);
-    Ok(())
+    Ok(res_at)
 }
 
 #[cfg(test)]
