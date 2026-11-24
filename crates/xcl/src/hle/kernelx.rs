@@ -813,6 +813,78 @@ struct Away {
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 
+/// The final sparse-GPU mapping state for each 64 KiB physical page touched by one kernel
+/// mapping call. A scatter can touch thousands of pages; queue the changes and apply them in
+/// batches instead of issuing a D3D12 tile-map update and fence signal for every page.
+#[derive(Default)]
+struct SparseBatch {
+    pages: std::collections::BTreeMap<usize, bool>,
+}
+
+impl SparseBatch {
+    fn set(&mut self, a: usize, n: usize, committed: bool) {
+        if n == 0 {
+            return;
+        }
+        let mut page = a & !(PHYS_PAGE - 1);
+        let end = a.saturating_add(n);
+        while page < end {
+            self.pages.insert(page, committed);
+            let Some(next) = page.checked_add(PHYS_PAGE) else { break };
+            page = next;
+        }
+    }
+
+    fn committed(&mut self, a: usize, n: usize) {
+        self.set(a, n, true);
+    }
+
+    fn decommitted(&mut self, a: usize, n: usize) {
+        self.set(a, n, false);
+    }
+
+    /// Flush only the final state of each page, with decommits before commits. Adjacent pages
+    /// with the same state become one range, so the sparse backend updates each window once.
+    unsafe fn flush(&mut self) {
+        if self.pages.is_empty() {
+            return;
+        }
+        let mut commits = Vec::new();
+        let mut decommits = Vec::new();
+        let mut run: Option<(bool, usize, usize)> = None;
+        for (&page, &committed) in &self.pages {
+            match run {
+                Some((state, start, end)) if state == committed && end == page => {
+                    run = Some((state, start, page.saturating_add(PHYS_PAGE)));
+                }
+                Some((state, start, end)) => {
+                    if state {
+                        commits.push((start, end - start));
+                    } else {
+                        decommits.push((start, end - start));
+                    }
+                    run = Some((committed, page, page.saturating_add(PHYS_PAGE)));
+                }
+                None => run = Some((committed, page, page.saturating_add(PHYS_PAGE))),
+            }
+        }
+        if let Some((state, start, end)) = run {
+            if state {
+                commits.push((start, end - start));
+            } else {
+                decommits.push((start, end - start));
+            }
+        }
+        self.pages.clear();
+        if !decommits.is_empty() {
+            crate::hle::d3d12x::sparse::decommitted_many(&decommits);
+        }
+        if !commits.is_empty() {
+            crate::hle::d3d12x::sparse::committed_many(&commits);
+        }
+    }
+}
+
 /// Whether a physical page is mapped at the page holding `va` away from its home – committed
 /// or not yet (`lazy`: a page never used is committed at its first access).
 pub fn physical_page_at(va: usize) -> bool {
@@ -828,10 +900,17 @@ pub fn gpu_view_map_gen() -> u64 {
     GPU_VIEW_MAP_GEN.load(Ordering::Acquire)
 }
 
+/// A console page-pool mapping changed the GPU view. On the host, texture resources read from
+/// their paired CPU view and are uploaded by title_textures before the next queue submission;
+/// invalidate the source cache so that refresh re-evaluates that alias.
+pub fn note_gpu_view_mapping() {
+    GPU_VIEW_MAP_GEN.fetch_add(1, Ordering::Release);
+}
+
 /// Pages are mapped or unmapped at `va`: a GPU view's mappings changed if it lies in one.
 fn note_mapping_at(va: usize) {
     if mirrors::source(va).is_some() {
-        GPU_VIEW_MAP_GEN.fetch_add(1, Ordering::Release);
+        note_gpu_view_mapping();
     }
 }
 
@@ -926,19 +1005,19 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
 /// A page's data went from `home` to another address: a home in a sparse window is
 /// decommitted at the end of the call or every 256 MB (`give_back_homes`; its GPU tiles go too: the GPU does
 /// not see the page while it is away).
-unsafe fn move_home_away(away: &mut Away, home: usize) {
+unsafe fn move_home_away(away: &mut Away, home: usize, sparse: &mut SparseBatch) {
     if lazy_home(home) {
         away.gone.push(home);
         // (256 MB at a time: a call that maps gigabytes would otherwise hold them twice until
         // it ends)
         if away.gone.len() >= 4096 {
-            give_back_homes(away);
+            give_back_homes(away, sparse);
         }
     }
 }
 
 /// The homes `move_home_away` collected, decommitted in runs of neighbouring pages.
-unsafe fn give_back_homes(away: &mut Away) {
+unsafe fn give_back_homes(away: &mut Away, sparse: &mut SparseBatch) {
     let mut homes = std::mem::take(&mut away.gone);
     homes.sort_unstable();
     homes.dedup();
@@ -952,7 +1031,7 @@ unsafe fn give_back_homes(away: &mut Away) {
             i += 1;
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(start)) {
-            crate::hle::d3d12x::sparse::decommitted(start, end - start);
+            sparse.decommitted(start, end - start);
         }
         mem::VirtualFree(start as *mut c_void, end - start, mem::MEM_DECOMMIT);
     }
@@ -960,20 +1039,27 @@ unsafe fn give_back_homes(away: &mut Away) {
 
 /// The page's home, committed again if `move_home_away` gave it back (None: it could not be).
 unsafe fn home_again(home: usize) -> Option<usize> {
+    let mut sparse = SparseBatch::default();
+    let result = home_again_batched(home, &mut sparse);
+    sparse.flush();
+    result
+}
+
+unsafe fn home_again_batched(home: usize, sparse: &mut SparseBatch) -> Option<usize> {
     if lazy_home(home) && !committed_page(home) {
         if mem::VirtualAlloc(home as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
             crate::xlog_warn!("physical page: its home {home:#x} could not be committed again");
             return None;
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(home)) {
-            crate::hle::d3d12x::sparse::committed(home, PHYS_PAGE);
+            sparse.committed(home, PHYS_PAGE);
         }
     }
     Some(home)
 }
 
 /// `n` pages from `home` committed (a sparse home is only reserved until it is used).
-unsafe fn commit_homes(home: usize, n: usize) -> bool {
+unsafe fn commit_homes(home: usize, n: usize, sparse: &mut SparseBatch) -> bool {
     let Some(u) = crate::gpu::uma::get() else { return false };
     if !lazy_home(home) {
         return true;
@@ -987,7 +1073,7 @@ unsafe fn commit_homes(home: usize, n: usize) -> bool {
         return false;
     }
     if u.is_sparse(home) {
-        crate::hle::d3d12x::sparse::committed(home, len);
+        sparse.committed(home, len);
     }
     true
 }
@@ -1022,7 +1108,7 @@ fn committed_page(a: usize) -> bool {
 
 /// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted); the homes
 /// in `committed` the caller has committed.
-unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usize>) {
+unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usize>, sparse: &mut SparseBatch) {
     if let Some(page) = away.at.remove(&at) {
         away.page.remove(&page);
         // never used where it was mapped: its home still holds the page (zeros)
@@ -1033,14 +1119,14 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
         let own = page_home(page);
         let pending = away.gone.len();
         away.gone.retain(|&h| Some(h) != own);
-        let home = if away.gone.len() < pending || own.is_some_and(|h| committed.contains(&h)) { own } else { own.and_then(|h| home_again(h)) };
+        let home = if away.gone.len() < pending || own.is_some_and(|h| committed.contains(&h)) { own } else { own.and_then(|h| home_again_batched(h, sparse)) };
         if let Some(home) = home {
             std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
         }
         // (an address among the homes the caller maps back is one of them: it stays)
         if !committed.contains(&at) && !crate::gpu::uma::get().is_some_and(|u| u.is_committed(at)) {
             if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-                crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
+                sparse.decommitted(at, PHYS_PAGE);
             }
             mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
         }
@@ -1125,14 +1211,16 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
 pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let r = map_pages(away, va, n, arr);
-    give_back_homes(away);
+    let mut sparse = SparseBatch::default();
+    let r = map_pages(away, va, n, arr, &mut sparse);
+    give_back_homes(away, &mut sparse);
+    sparse.flush();
     r
 }
 
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
 /// caller (`give_back_homes`).
-unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
+unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize, sparse: &mut SparseBatch) -> *mut c_void {
     note_mapping_at(va as usize);
     if crate::gpu::uma::get().is_none() || n == 0 || (va.is_null() && arr.is_null()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1151,7 +1239,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED); // scattered pages need an address
             return std::ptr::null_mut();
         };
-        if !commit_homes(home, n) {
+        if !commit_homes(home, n, sparse) {
             fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
             return std::ptr::null_mut();
         }
@@ -1159,7 +1247,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         away.gone.retain(|&h| h < home || h >= home + n * PHYS_PAGE);
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
-                unmap_away(away, at, &(home..home + n * PHYS_PAGE));
+                unmap_away(away, at, &(home..home + n * PHYS_PAGE), sparse);
             }
         }
         return home as *mut c_void;
@@ -1172,12 +1260,12 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     let in_uma = |a: usize| crate::gpu::uma::get().is_some_and(|u| u.is_committed(a));
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
-        unmap_away(away, at, &(0..0));
+        unmap_away(away, at, &(0..0), sparse);
         if p == 0 {
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
-            unmap_away(away, old, &(0..0));
+            unmap_away(away, old, &(0..0), sparse);
         }
         let fresh = !in_uma(at) && !committed_page(at);
         let home = page_home(p).unwrap();
@@ -1196,12 +1284,12 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         }
         if committed_page(home) {
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
-            move_home_away(away, home);
+            move_home_away(away, home, sparse);
         } else if !fresh {
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-            crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+            sparse.committed(at, PHYS_PAGE);
         }
         away.at.insert(at, p);
         away.page.insert(p, at);
@@ -1233,8 +1321,19 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
-    give_back_homes(away);
+    let mut sparse = SparseBatch::default();
+    let started = std::time::Instant::now();
+    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize, &mut sparse).is_null());
+    give_back_homes(away, &mut sparse);
+    sparse.flush();
+    let elapsed = started.elapsed();
+    if n >= 1024 || elapsed.as_millis() >= 100 {
+        crate::xlog_info!(
+            "kernelx: XMemMapPhysicalPagesScatter: {n} pages, {:.1} ms, success={}",
+            elapsed.as_secs_f64() * 1000.0,
+            ok
+        );
+    }
     ok as BOOL
 }
 
