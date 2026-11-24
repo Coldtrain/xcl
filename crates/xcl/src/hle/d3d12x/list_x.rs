@@ -2232,30 +2232,16 @@ unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return None;
     }
-    let (alloc, last_queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf, pred_in_state, active_query, ended_early, written_ranges, bindings) = {
-        let mut g = LISTS.lock().unwrap();
-        let s = g.as_mut()?.get_mut(&(list as usize))?;
+    // Take a read-only snapshot first. Do not end queries or change predication tracking until
+    // the continuation has actually been created; a failed CreateCommandList must leave the
+    // original recording completely intact.
+    let (alloc, last_queue, bound_pso, depth_bias, index_buffer, depth_bounds, predication, pred_buf) = {
+        let g = LISTS.lock().unwrap();
+        let s = g.as_ref()?.get(&(list as usize))?;
         if s.allocator == 0 {
             return None;
         }
-        let active_query = s.occlusion.end_active_early();
-        let ended_early = std::mem::take(&mut s.occlusion.ended_early);
-        let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
-        (
-            s.allocator,
-            s.last_queue,
-            s.bound_pso,
-            s.depth_bias,
-            s.index_buffer,
-            s.depth_bounds,
-            s.predication,
-            s.pred_buf.clone(),
-            pred_in_state,
-            active_query,
-            ended_early,
-            s.written_ranges.clone(),
-            s.bindings.clone(),
-        )
+        (s.allocator, s.last_queue, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, s.predication, s.pred_buf.clone())
     };
 
     // Prepare the continuation BEFORE closing the current list. If allocation fails, the
@@ -2291,6 +2277,15 @@ unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*
                 return None;
             }
         },
+    };
+
+    let (active_query, ended_early, pred_in_state, written_ranges, bindings) = {
+        let mut g = LISTS.lock().unwrap();
+        let s = g.as_mut()?.get_mut(&(list as usize))?;
+        let active_query = s.occlusion.end_active_early();
+        let ended_early = std::mem::take(&mut s.occlusion.ended_early);
+        let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
+        (active_query, ended_early, pred_in_state, s.written_ranges.clone(), s.bindings.clone())
     };
 
     if let Some(((h, i), qty)) = active_query {
