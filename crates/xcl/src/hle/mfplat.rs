@@ -13,6 +13,7 @@
 //! `IMFDXGIDeviceManager::ResetDevice` with the caller's `resetToken`.
 
 #![allow(non_snake_case)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
@@ -366,13 +367,7 @@ mod tests {
 
 // Victory-derived Media Foundation source resolver proxy. See the VFS translation
 // in `local()` before a local file URL reaches the host resolver.
-//! Source resolver proxy: translate console virtual-drive video paths through XCL VFS
-//! before forwarding local-file requests to Windows Media Foundation.
-#![allow(non_snake_case)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-
 use std::collections::HashSet;
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
