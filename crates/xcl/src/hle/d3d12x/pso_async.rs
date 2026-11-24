@@ -74,7 +74,7 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
+/// Number of workers that build complete D3D12 pipeline objects. DXC has its own pool; keeping\n/// this independently tunable helps distinguish driver/PSO contention from DXC throughput.\npub fn worker_threads() -> usize {\n    static N: OnceLock<usize> = OnceLock::new();\n    *N.get_or_init(|| {\n        std::env::var(\"XCL_PSO_THREADS\")\n            .ok()\n            .and_then(|v| v.trim().parse::<usize>().ok())\n            .unwrap_or_else(crate::gpu::recomp::dxc::compile_threads)\n            .clamp(1, 64)\n    })\n}\n\nfn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
     Q.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Arc<Pending>>();
@@ -248,7 +248,7 @@ fn preload() -> Option<&'static Preload> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        let n = (worker_threads() / 4).clamp(2, 4);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 unsafe {
