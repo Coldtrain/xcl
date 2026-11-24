@@ -105,7 +105,7 @@ fn map_page_alias_range_with_stride(destination: usize, source: usize, pages: us
 }
 
 /// A queue batch can reuse the same pool address after its physical backing changed. Notify
-/// the destination even when its source pointer is identical (range type 3 also reaches here).
+/// the destination even when its source pointer is identical.
 pub(super) fn note_page_alias_range_changed(destination: usize, pages: usize) {
     if let Some(len) = pages.checked_mul(GPU_PAGE_SIZE) {
         if let Some(end) = destination.checked_add(len) {
