@@ -5,9 +5,9 @@
 //! directly indexed descriptor heaps (images / samplers). Mapping the title's root arguments
 //! onto that ABI at draw time is the next step (needs the console runtime's user-data layout).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -425,6 +425,21 @@ impl ShaderCache {
     }
 }
 
+/// Coalesce simultaneous translations of the same console shader. A retail title can
+/// request one shader from many PSOs at once; without this flight lock every caller misses
+/// the LRU cache before any of them inserts the result and repeats the expensive translation.
+fn shader_flight(key: &ShaderKey) -> Arc<Mutex<()>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<ShaderKey, Weak<Mutex<()>>>>> = OnceLock::new();
+    let mut flights = FLIGHTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    flights.retain(|_, flight| flight.strong_count() != 0);
+    if let Some(flight) = flights.get(key).and_then(Weak::upgrade) {
+        return flight;
+    }
+    let flight = Arc::new(Mutex::new(()));
+    flights.insert(key.clone(), Arc::downgrade(&flight));
+    flight
+}
+
 fn cached_shader(
     cache: &Mutex<ShaderCache>,
     key: ShaderKey,
@@ -435,7 +450,15 @@ fn cached_shader(
         dxc::note_memory_hit();
         return Ok(shader);
     }
-    // Keep compilation outside the cache lock, including cached-only probes.
+    // One caller translates a given shader at a time; unrelated shaders remain fully parallel.
+    let flight = shader_flight(&key);
+    let _flight = flight.lock().unwrap_or_else(|e| e.into_inner());
+    // Another PSO may have completed this shader while this caller waited.
+    if let Some(shader) = cache.lock().unwrap().get(&key, blob) {
+        dxc::note_memory_hit();
+        return Ok(shader);
+    }
+    // Keep translation outside the global cache lock.
     let shader = Arc::new(compile_one()?);
     let mut cache = cache.lock().unwrap();
     if let Some(existing) = cache.get(&key, blob) {
