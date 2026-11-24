@@ -4028,10 +4028,14 @@ impl Em {
         }
     }
 
-    /// Split wave64: whether the pairs meet through arrival counters (several console waves
-    /// per group, or `XCL_WAVE64_SPIN` for testing) instead of group barriers.
+    /// Split wave64: whether the two host waves meet through arrival counters instead of
+    /// a group barrier. Victory found that barriers inside divergent wave64 control flow could
+    /// lose the device; use the counter-based rendezvous by default, retaining the old barrier
+    /// form only as an explicit diagnostic opt-in (`XCL_WAVE64_BARRIER=1`).
     fn x64_spin(&self) -> bool {
-        self.x64_threads() > 64 || std::env::var_os("XCL_WAVE64_SPIN").is_some()
+        self.x64_threads() > 64
+            || std::env::var_os("XCL_WAVE64_SPIN").is_some()
+            || std::env::var_os("XCL_WAVE64_BARRIER").is_none()
     }
 
     /// The console LDS block (`xcl_lds`) is declared before the split-wave64 prelude, which
