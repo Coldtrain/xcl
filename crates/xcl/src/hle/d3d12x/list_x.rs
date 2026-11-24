@@ -2258,24 +2258,9 @@ unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*
         )
     };
 
-    if let Some(((h, i), qty)) = active_query {
-        pc::<QueryFn>(list, PC_END_QUERY)(list, h, qty, i);
-    }
-    if pred_in_state {
-        if let Some(ref pb) = pred_buf {
-            transition(list, pb.as_raw() as usize, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
-        }
-    }
-
-    let ext = *(list as *const usize);
-    let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
-    real::preserve_vtable(list, ext);
-    if close_hr < 0 {
-        static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
-        warn(&CLOSE_ERR, "Wait64 mid-list split", format_args!("Close failed ({close_hr:#x})"));
-        return None;
-    }
-
+    // Prepare the continuation BEFORE closing the current list. If allocation fails, the
+    // original list must remain open: returning None after Close would make the title keep
+    // recording into a closed command list, and its eventual Close/Execute would fail too.
     let init_pso = if ty == D3D12_COMMAND_LIST_TYPE_COPY {
         0
     } else {
@@ -2291,6 +2276,9 @@ unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*
         real::preserve_vtable(spare, ext_spare);
         if reset_hr >= 0 {
             next_pc = Some(spare);
+        } else {
+            static SPARE_RESET_ERR: AtomicU64 = AtomicU64::new(0);
+            warn(&SPARE_RESET_ERR, "Wait64 mid-list split", format_args!("spare command-list Reset failed ({reset_hr:#x}); allocating a fresh continuation"));
         }
     }
     let next_pc = match next_pc {
@@ -2299,11 +2287,31 @@ unsafe fn try_split_for_wait(list: *mut c_void, after_write64: bool) -> Option<*
             Some(p) => p,
             None => {
                 static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed"));
+                warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed; leaving the original list open"));
                 return None;
             }
         },
     };
+
+    if let Some(((h, i), qty)) = active_query {
+        pc::<QueryFn>(list, PC_END_QUERY)(list, h, qty, i);
+    }
+    if pred_in_state {
+        if let Some(ref pb) = pred_buf {
+            transition(list, pb.as_raw() as usize, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+        }
+    }
+
+    let ext = *(list as *const usize);
+    let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
+    real::preserve_vtable(list, ext);
+    if close_hr < 0 {
+        static CLOSE_ERR: AtomicU64 = AtomicU64::new(0);
+        warn(&CLOSE_ERR, "Wait64 mid-list split", format_args!("Close failed ({close_hr:#x}); continuation discarded"));
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = pc(next_pc, 2);
+        release(next_pc);
+        return None;
+    }
 
     let old_next = {
         let mut g = LISTS.lock().unwrap();
