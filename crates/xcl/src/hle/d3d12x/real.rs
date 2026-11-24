@@ -5064,6 +5064,9 @@ unsafe fn copy_page_mappings_batch_x(count: usize, batches: usize, pool: usize, 
                 crate::xlog_warn!("D3D12.X: invalid CopyPageMappingsBatchX range kind={} start={} count={} destination={destination:#x}", range.kind, range.start, range.count);
                 return E_INVALIDARG;
             }
+            if pages != 0 {
+                super::title_textures::note_page_alias_range_changed(destination, pages);
+            }
             destination = next_destination;
         }
     }
