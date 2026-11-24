@@ -5091,6 +5091,14 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
     }
     let mut shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
+    if slot == 31 {
+        static PAGE_MAP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = PAGE_MAP_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            let registered = super::device_x::is_registered_page_pool(a3 as u64, a4 as u32);
+            crate::xlog_info!("D3D12.X: raw queue slot 31 #{n}: count={}, batches={a2:#x}, pool={a3:#x}, pool_pages={}, flags={:#x}, registered={registered}, shifted={}", a1 as u32, a4 as u32, a5 as u32, QUEUE_SHIFTED.load(Ordering::Relaxed));
+        }
+    }
     // Slot 31's five-argument page-pool update is itself a reliable newer-layout
     // signal when its pool address/size match a prior RegisterPagePoolX call.
     if slot == 31 && !shifted
