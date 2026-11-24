@@ -677,7 +677,7 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     // console's B5G5R5A1 / B4G4R4A4 targets and R9G9B9E5 shared-exponent targets.
     // The title's GPU memory is not laid out for these resources, so the host copy may differ.
     if flags & 5 != 0 {
-        let host_format = match format {
+        let host_format: Option<u32> = match format {
             67 => Some(10),       // R16G16B16A16_FLOAT
             86 | 115 => Some(28), // R8G8B8A8_UNORM
             _ => None,
