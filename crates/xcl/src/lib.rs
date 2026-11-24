@@ -16,6 +16,7 @@ pub mod bc6pack;
 mod bc1pack;
 mod bc5pack;
 pub mod bc7pack;
+pub mod rds5;
 mod bcpack_rans;
 pub mod hle;
 pub mod hooks;

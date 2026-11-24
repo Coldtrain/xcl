@@ -327,6 +327,13 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     // (a new texture object, or the address of an old one again: its first upload is not left out)
     LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
+    if let Some(meta) = crate::rds5::texture_at_runtime_address(va) {
+        crate::xlog_info!(
+            "D3D12.X: texture at {va:#x} matched RDS5/ETPF hash {:#018x}: {}x{}, DXGI {}, {} mips (descriptor field), array {}, kind {}, tile mode {}",
+            meta.hash, meta.width, meta.height, meta.dxgi_format, meta.mips_field(),
+            meta.array_size(), meta.kind(), meta.tile_mode()
+        );
+    }
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
     if matches!(u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), 116 | 117) {

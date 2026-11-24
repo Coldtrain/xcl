@@ -441,6 +441,8 @@ struct FileInner {
     id: u32,
     path: Vec<u16>,
     file: Mutex<Option<Arc<std::fs::File>>>,
+    /// Parsed RDS5/ETPF chunk and texture metadata, when this is a texture store.
+    rds5: Option<Arc<crate::rds5::RuntimeStore>>,
 }
 
 impl FileInner {
@@ -475,7 +477,8 @@ unsafe extern "system" fn factory_open_file(_p: *mut c_void, path: *const u16, r
             return e.raw_os_error().map_or(E_INVALIDARG, |c| (0x8007_0000u32 | (c as u32 & 0xFFFF)) as i32);
         }
     };
-    let inner = Arc::new(FileInner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), path: name.encode_utf16().collect(), file: Mutex::new(Some(Arc::new(file))) });
+    let rds5 = crate::rds5::open(&name);
+    let inner = Arc::new(FileInner { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), path: name.encode_utf16().collect(), file: Mutex::new(Some(Arc::new(file))), rds5 });
     let o = new_object(file_vtbl(), inner);
     let hr = file_qi(o, riid, out);
     file_release(o);
@@ -710,8 +713,16 @@ impl Request {
                     return Err(E_DESTINATION_SIZE);
                 }
             }
-            (false, 5 | 6) => {
+            (false, 5 | 6 | 7) => {
                 if self.destination_size == 0 || self.destination_size % 16 != 0 || self.intermediate_size != 0 {
+                    return Err(E_DESTINATION_SIZE);
+                }
+            }
+            (true, 7) => {
+                if self.destination_size == 0 || self.destination_size % 16 != 0
+                    || (self.intermediate_size != 0
+                        && (self.intermediate_size <= self.source_size || self.intermediate_size >= self.destination_size))
+                {
                     return Err(E_DESTINATION_SIZE);
                 }
             }
@@ -848,7 +859,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         ));
         return Err(E_DECOMPRESSION);
     }
-    if r.bcpack() != 0 && r.bcpack() != 1 && r.bcpack() != 5 && r.bcpack() != 6 {
+    if r.bcpack() != 0 && r.bcpack() != 1 && r.bcpack() != 5 && r.bcpack() != 6 && r.bcpack() != 7 {
         warn_once("DirectStorage BCPack", format_args!(
             "mode {} is not decoded by the host path (swizzle={}, zlib={}, src={}, intermediate={}, dst={})",
             r.bcpack(), r.swizzle(), r.zlib(), r.source_size, r.intermediate_size, n
@@ -856,7 +867,53 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.bcpack() == 1 {
+    if !r.dest_physical_pages() {
+        if let Some(store) = file.and_then(|f| f.rds5.as_ref()) {
+            if store.observe_request(
+                r.offset, r.source_size as usize, r.destination as usize,
+                r.destination_size as usize, r.bcpack(), r.zlib(),
+            ) {
+                static MATCHES: AtomicU64 = AtomicU64::new(0);
+                let k = MATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+                if k <= 8 || k.is_power_of_two() {
+                    crate::xlog_info!("DirectStorage: RDS5 metadata matched request #{k} in '{}': file {:#x}, codec mode {}, destination {:#x} ({} bytes)",
+                        store.store.path, r.offset, r.bcpack(), r.destination, r.destination_size);
+                }
+            }
+        }
+    }
+
+    let payload: Vec<u8> = if r.bcpack() == 7 {
+        // Transform order: zlib (if present), then BC7 BCPack. The output is standard 16-byte BC7 blocks.
+        let packed = if r.zlib() {
+            let limit = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
+            let d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, limit)
+                .map_err(|_| E_ZLIB_DATA)?;
+            if r.intermediate_size != 0 && d.len() != limit { return Err(E_ZLIB_DATA); }
+            d
+        } else { src };
+        let Some(decoded) = crate::bc7pack::decode(&packed, n / 16) else {
+            warn_once("BCPack BC7 decode failure", format_args!(
+                "entropy/block decode rejected stream: packed={}, blocks={}, dst={}, src={}, intermediate={}, zlib={}",
+                packed.len(), n / 16, n, r.source_size, r.intermediate_size, r.zlib()
+            ));
+            return Err(E_DECOMPRESSION);
+        };
+        if decoded.blocks.len() != n {
+            warn_once("BCPack BC7 output size", format_args!(
+                "decoded {} bytes, expected {} (packed={}, src={}, intermediate={})",
+                decoded.blocks.len(), n, packed.len(), r.source_size, r.intermediate_size
+            ));
+            return Err(E_DECOMPRESSION);
+        }
+        if decoded.unfitted_blocks != 0 || decoded.invalid_blocks != 0 {
+            warn_once("BCPack BC7 preset history / anchors", format_args!(
+                "{} blocks used fallback history; {} blocks had invalid anchors (normalized by decoder)",
+                decoded.unfitted_blocks, decoded.invalid_blocks
+            ));
+        }
+        decoded.blocks
+    } else if r.bcpack() == 1 {
         // Transform order: zlib (if present), then BCPack. BC1 BCPack restores
         // ordinary 8-byte BC1 blocks in stream/Gfx10 order.
         let packed = if r.zlib() {
