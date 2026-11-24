@@ -1659,7 +1659,8 @@ mod tests {
         let mem = Request::parse(&request(SOURCE_MEMORY_BIT | 1, 0x1000, 64, 0x2000, 0x99, 20));
         assert_eq!((mem.offset, mem.check(true)), (0, Ok(())), "a memory source has no offset");
         assert_eq!(Request::parse(&request(1, 0x1000, 20, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request(3, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BC1 remains unsupported");
+        assert_eq!(Request::parse(&request(3, 0x1000, 64, 0x2000, 0, 20)).check(false), Ok(()), "zlib + BC1 BCPack is supported");
+        assert_eq!(Request::parse(&request(2 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 32)).check(false), Err(E_DECOMPRESSION), "BC2 remains unsupported");
         assert_eq!(Request::parse(&request(6 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 32)).check(false), Ok(()), "BC6H BCPack");
         assert_eq!(Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 32)).check(false), Ok(()), "BC7 BCPack");
         assert_eq!(Request::parse(&request(7 << BCPACK_SHIFT, 0x1000, 63, 0x2000, 0, 32)).check(false), Err(E_DESTINATION_SIZE), "BC7 output must contain whole 16-byte blocks");
