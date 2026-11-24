@@ -748,8 +748,9 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         // R32_TYPELESS, R16_TYPELESS
         (39 | 40, 0 | 39 | 40) => 41,
         (53 | 55, 0 | 53 | 55) => 56,
-        // a target made R8G8B8A8 (`pc_resource_desc`)
-        (28, 86 | 115) => 28,
+        // targets remapped to host formats by `pc_resource_desc`
+        (10, 67) => 10,       // R9G9B9E5_SHAREDEXP → R16G16B16A16_FLOAT
+        (28, 86 | 115) => 28, // B5G5R5A1 / B4G4R4A4 → R8G8B8A8
         (_, v) => v,
     }
 }
@@ -1087,6 +1088,7 @@ mod tests {
         assert_eq!(pc_shader_view_format(39, 0), 41);
         assert_eq!(pc_shader_view_format(19, 62), 22);
         assert_eq!(pc_shader_view_format(28, 86), 28);
+        assert_eq!(pc_shader_view_format(10, 67), 10, "R9G9B9E5 target made RGBA16F");
         assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
         assert_eq!((pc_target_format(67), pc_target_format(86), pc_target_format(118), pc_view_format(117)), (10, 28, 45, 10));
     }
