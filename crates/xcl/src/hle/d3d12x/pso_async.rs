@@ -270,7 +270,7 @@ fn preload_max() -> usize {
         std::env::var("XCL_PSO_PRELOAD_MAX")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(4096)
+            .unwrap_or(512)
             .min(1_000_000)
     })
 }
@@ -307,8 +307,33 @@ fn preload_has_commit_headroom() -> bool {
     let reserve_gb = std::env::var("XCL_PSO_PRELOAD_RESERVE_GB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(8);
-    m.ullAvailPageFile >= reserve_gb.saturating_mul(1u64 << 30)
+        .unwrap_or(12);
+    if m.ullAvailPageFile < reserve_gb.saturating_mul(1u64 << 30) {
+        return false;
+    }
+
+    // Also bound this process itself. System-wide commit can look healthy while XCL's
+    // own retained driver PSOs and game allocations have already consumed most of its
+    // practical address-space/commit budget.
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let measured = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+            counters.cb,
+        )
+    } != 0;
+    if !measured {
+        return false;
+    }
+    let process_limit_gb = std::env::var("XCL_PSO_PRELOAD_PROCESS_LIMIT_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(12);
+    (counters.PrivateUsage as u64) < process_limit_gb.saturating_mul(1u64 << 30)
 }
 
 fn preload() -> Option<&'static Preload> {
