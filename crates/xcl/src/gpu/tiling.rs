@@ -104,7 +104,7 @@ impl Layout {
         if mode == 0 {
             let bw = 256 >> elem_log2;
             let ox: Arc<[u32]> = (0..bw as u32).map(|x| x << elem_log2).collect::<Vec<_>>().into();
-            let z: Arc<[u32]> = Arc::from([0u32]);
+            let z: Arc<[u32]> = vec![0u32].into();
             return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: Arc::clone(&z), oz: Arc::clone(&z), hx: Arc::clone(&z), hy: Arc::clone(&z), hz: z });
         }
         let blk = block_log2(mode)?;
