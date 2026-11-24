@@ -219,12 +219,10 @@ pub fn decode_states(chunk: &[u8], blocks: usize, t: &Tables) -> Option<(Bc7Outp
     if blocks == 0 {
         return None;
     }
-    let mut source = crate::bcpack_rans::rans::SliceSource { data: chunk, pos: 0 };
-    let lanes = crate::bcpack_rans::rans::decode_lanes(
-        &mut source,
+    let lanes = crate::bcpack_rans::rans::decode_slice(
+        chunk,
         &BC7_ALPHABET_BITS,
         symbols,
-        chunk.len(),
     ).ok()?;
     let lane: Vec<&[u16]> = (0..16).map(|k| lanes.lane(k)).collect();
     let sym = |l: usize, i: usize, h: usize| lane[l][2 * i + h];
