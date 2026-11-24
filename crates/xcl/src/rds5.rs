@@ -161,7 +161,15 @@ pub fn open(path: &str) -> Option<Arc<RuntimeStore>> {
     if !path.to_ascii_lowercase().ends_with(".ttpf") { return None; }
     let mut file = File::open(path).ok()?;
     let file_len = file.metadata().ok()?.len();
-    let store = Store::parse(&mut file, path.to_string(), file_len).ok()?;
+    let store = match Store::parse(&mut file, path.to_string(), file_len) {
+        Ok(store) => store,
+        Err(error) => {
+            crate::xlog_warn!("RDS5: could not index '{}': {error}", path);
+            return None;
+        }
+    };
+    crate::xlog_info!("RDS5: indexed '{}': {} chunks, {} ETPF textures, file {} bytes, virtual space {:#x}",
+        store.path, store.chunks.len(), store.textures.len(), store.file_len, store.virtual_size);
     let runtime = Arc::new(RuntimeStore { store, bases: Mutex::new(Vec::new()) });
     let mut stores = STORES.get_or_init(|| Mutex::new(Vec::new())).lock().ok()?;
     stores.retain(|w| w.strong_count() > 0);
